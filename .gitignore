@@ -1,0 +1,26 @@
+# Local builds and generated runtime data
+/build/
+/output/
+/.vscode/
+
+# Unpacked/downloaded third-party SDKs and archives. Keep build helpers only.
+/thirdparty/*
+!/thirdparty/scripts/
+!/thirdparty/scripts/**
+
+# Sapiens2 weights use external ONNX data and are several GB. Obtain them
+# separately and place them at the paths documented in README.md.
+/models/face_keypoints/sapiens2_pose/*.onnx
+/models/face_segmentation/sapiens2_seg/*.onnx
+/models/face_segmentation/sapiens2_seg/*.onnx.data
+
+# Only data/head.stl is the runtime registration target.
+/data/stl/
+
+# Local editor and transient files
+*.user
+*.suo
+*.tmp
+*.log
+.DS_Store
+Thumbs.db

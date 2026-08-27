@@ -1,0 +1,62 @@
+runtime:
+  log_level: info
+  output_directory: output
+  face_detector_model: models/face_detection/yolo_face/yolov12n-face.onnx
+  face_keypoint_model: models/face_keypoints/hrnet/hrnetv2_w18_wflw_256x256_heatmap.onnx
+  onnx_provider: cuda
+
+pipeline:
+  # Number of camera frames whose face detections run concurrently. Reduce to
+  # 2 or 4 when multiple CUDA detector sessions exceed available GPU memory.
+  detection_frames: 4
+
+registration:
+  voxel_size_mm: 5.0
+  min_fitness: 0.90
+  max_inlier_rmse_mm: 3.0
+  max_source_to_target_rmse_mm: 6.0
+  max_source_to_target_p95_mm: 10.0
+  stl_point_generation: head_surface_area_sampling
+  stl_surface_crop_axis: Y
+  stl_surface_crop_ratio: 0.40
+  stl_surface_target_points: 100000
+  stl_surface_voxel_mm: 1.0
+  stl_surface_multi_view_visibility: false
+  target_unit_scale: 1.0
+  initial_fitness_to_skip_global: 0.90
+  initial_rmse_to_skip_global_mm: 3.0
+  initial_source_to_target_rmse_to_skip_global_mm: 6.0
+  initial_source_to_target_p95_to_skip_global_mm: 10.0
+
+model_keypoints:
+  render_width: 1280
+  render_height: 960
+  model_unit_scale: 1.0
+  min_score: 0.0
+  min_named_keypoints: 3
+  azimuth_degrees: [0, -10, 10, -15, 15, -20, 20]
+  elevation_degrees: [6, 0, -6, 10]
+
+camera_keypoints:
+  # triplet_vote preserves the existing 3-point combination voting solver.
+  # overdetermined_svd performs one least-squares SVD using every matched point.
+  pose_solver: triplet_vote
+  extraction_min_valid_3d_keypoints: 3
+  pose_min_inlier_keypoints: 5
+  pose_max_rmse_mm: 6.0
+  pose_min_mean_score: 0.50
+  camera_keypoint_search_radius_px: 6
+  keypoint_inlier_threshold_mm: 15.0
+
+face_selection:
+  min_detection_score: 0.10
+  min_point_count: 1000
+  min_point_density: 0.15
+  min_depth_mm: 200.0
+  max_depth_mm: 2000.0
+  min_planar_span_mm: 45.0
+  max_planar_span_mm: 220.0
+  min_depth_relief_mm: 12.0
+  max_depth_relief_mm: 100.0
+  min_depth_mad_mm: 2.0
+  max_depth_mad_mm: 30.0

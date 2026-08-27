@@ -1,0 +1,16 @@
+# Reference values for the command-line demo. The current demo takes CLI arguments;
+# this file documents recommended camera settings and is not parsed automatically.
+camera:
+  # Command-line backend: orbbec or vcamera.
+  backend: orbbec
+  serial_number: ""
+  ip_address: ""
+  color_width: 1280
+  color_height: 800
+  depth_width: 1280
+  depth_height: 800
+  fps: 30
+  align_depth_to_color: true
+  # Vcamera PS800 structured-light settings. Applied before stream start.
+  laser_auto_control: false
+  laser_power: 25

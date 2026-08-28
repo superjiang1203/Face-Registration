@@ -4,6 +4,7 @@
 #include <array>
 #include <cmath>
 #include <filesystem>
+#include <iostream>
 #include <limits>
 #include <stdexcept>
 
@@ -33,11 +34,17 @@ void Sapiens2PoseEstimator::load(const std::string& modelPath) {
     so.SetIntraOpNumThreads(1);
     so.SetInterOpNumThreads(1);
     if (options_.preferCuda) {
-        OrtCUDAProviderOptions cuda{};
-        cuda.device_id = options_.deviceId;
-        cuda.cudnn_conv_algo_search = OrtCudnnConvAlgoSearchHeuristic;
-        so.AppendExecutionProvider_CUDA(cuda);
-        usingCuda_ = true;
+        try {
+            OrtCUDAProviderOptions cuda{};
+            cuda.device_id = options_.deviceId;
+            cuda.cudnn_conv_algo_search = OrtCudnnConvAlgoSearchHeuristic;
+            so.AppendExecutionProvider_CUDA(cuda);
+            usingCuda_ = true;
+        } catch (const std::exception& exception) {
+            std::cerr << "Sapiens Pose CUDA unavailable; falling back to CPU: "
+                      << exception.what() << '\n';
+            usingCuda_ = false;
+        }
     }
 #ifdef _WIN32
     const auto wide = std::filesystem::path(modelPath).wstring();

@@ -86,7 +86,8 @@ namespace {
 
 } // namespace
 
-FaceKeypointService::FaceKeypointService(std::string modelPath)
+FaceKeypointService::FaceKeypointService(
+    std::string modelPath, bool preferCuda, int deviceId)
     // ONNX Runtime uses the logger of the first environment created in this
     // process for some CUDA kernel messages from later sessions.  In the
     // camera pipeline this service is created before the CUDA face detector,
@@ -95,6 +96,7 @@ FaceKeypointService::FaceKeypointService(std::string modelPath)
     // suppressing those misleading provider warnings.
     : env_(std::make_unique<Ort::Env>(ORT_LOGGING_LEVEL_ERROR, "FaceRegistration")),
       modelPath_(modelPath.empty() ? defaultModelPath() : std::move(modelPath)),
+      preferCuda_(preferCuda), deviceId_(deviceId),
       inputWidth_(kDefaultInputWidth), inputHeight_(kDefaultInputHeight) {
 }
 
@@ -138,9 +140,24 @@ bool FaceKeypointService::load(std::string* error) {
         so.SetInterOpNumThreads(1);
         so.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
 
-        // CPU is the portable default. It avoids a partially installed CUDA provider
-        // preventing the otherwise valid model from loading.
         usingCuda_ = false;
+        if (preferCuda_) {
+            try {
+#ifdef _WIN32
+                HMODULE cudnn = LoadLibraryA("cudnn64_9.dll");
+                if (!cudnn) throw std::runtime_error("cudnn64_9.dll missing");
+                FreeLibrary(cudnn);
+#endif
+                OrtCUDAProviderOptions cudaOptions{};
+                cudaOptions.device_id = deviceId_;
+                cudaOptions.cudnn_conv_algo_search = OrtCudnnConvAlgoSearchHeuristic;
+                so.AppendExecutionProvider_CUDA(cudaOptions);
+                usingCuda_ = true;
+            } catch (const std::exception& exception) {
+                if (error) *error = std::string("cannot enable CUDA for HRNet: ") + exception.what();
+                return false;
+            }
+        }
 
 #ifdef _WIN32
         const std::wstring wpath = std::filesystem::absolute(modelPath_).wstring();
@@ -271,8 +288,9 @@ FaceKeypointService::Detection FaceKeypointService::detect(const cv::Mat& bgr, s
     result.imageWidth = bgr.cols;
     result.imageHeight = bgr.rows;
 
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (!session_ && !load(error)) {
+    // Ort::Session::Run is thread-safe. Lock only lazy initialization so a
+    // captured frame batch can run HRNet concurrently through one session.
+    if (!ensureLoaded(error)) {
         return result;
     }
 

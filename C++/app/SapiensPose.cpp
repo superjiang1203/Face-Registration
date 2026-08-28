@@ -26,7 +26,7 @@ float maskSupportRatio(const cv::Mat& mask, const cv::Point2f& point, int radius
 
 int main(int argc, char** argv) try {
     if (argc < 5) {
-        std::cerr << "Usage: sapiens2_pose_onnx_test <model.onnx> <color.png> <face_mask.png> <output_dir>"
+        std::cerr << "Usage: sapiens_pose <model.onnx> <color.png> <face_mask.png> <output_dir>"
                      " [pose_score_threshold=0.25] [mask_support_threshold=0.20] [mask_radius_px=5]\n";
         return 2;
     }

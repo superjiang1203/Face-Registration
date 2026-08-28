@@ -1,6 +1,7 @@
 # Local builds and generated runtime data
 /build/
 /output/
+/transfer_packages/
 /.vscode/
 
 # Unpacked/downloaded third-party SDKs and archives. Keep build helpers only.

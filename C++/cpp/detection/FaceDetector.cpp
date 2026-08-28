@@ -321,9 +321,12 @@ bool FaceDetector::loadOnnx(const std::string& onnxPath) {
                 }
                 FreeLibrary(cudnn);
 #endif
-                OrtCUDAProviderOptions cudaOpts;
-                std::memset(&cudaOpts, 0, sizeof(cudaOpts));
+                OrtCUDAProviderOptions cudaOpts{};
                 cudaOpts.device_id = 0;
+                // Keep first online inference deterministic across keypoint
+                // provider branches. Exhaustive cuDNN benchmarking is lazy
+                // and otherwise runs independently in every frame Session.
+                cudaOpts.cudnn_conv_algo_search = OrtCudnnConvAlgoSearchHeuristic;
                 so.AppendExecutionProvider_CUDA(cudaOpts);
                 usingCuda_ = true;
             } catch (...) {

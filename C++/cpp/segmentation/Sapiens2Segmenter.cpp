@@ -4,6 +4,7 @@
 #include <array>
 #include <cstring>
 #include <filesystem>
+#include <iostream>
 #include <limits>
 #include <stdexcept>
 
@@ -38,13 +39,16 @@ void Sapiens2Segmenter::load(const std::string& modelPath) {
     so.SetInterOpNumThreads(1);
     usingCuda_ = false;
     if (options_.preferCuda) {
-        OrtCUDAProviderOptions cuda{};
-        cuda.device_id = options_.deviceId;
-        // With recent ORT + cuDNN Frontend, "Default" maps to the slow
-        // FALLBACK heuristic and emits a warning for every Conv node.
-        cuda.cudnn_conv_algo_search = OrtCudnnConvAlgoSearchHeuristic;
-        so.AppendExecutionProvider_CUDA(cuda);
-        usingCuda_ = true;
+        try {
+            OrtCUDAProviderOptions cuda{};
+            cuda.device_id = options_.deviceId;
+            cuda.cudnn_conv_algo_search = OrtCudnnConvAlgoSearchHeuristic;
+            so.AppendExecutionProvider_CUDA(cuda);
+            usingCuda_ = true;
+        } catch (const std::exception& exception) {
+            std::cerr << "Sapiens Seg CUDA unavailable; falling back to CPU: "
+                      << exception.what() << '\n';
+        }
     }
 
 #ifdef _WIN32

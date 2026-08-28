@@ -3,12 +3,30 @@ runtime:
   output_directory: output
   face_detector_model: models/face_detection/yolo_face/yolov12n-face.onnx
   face_keypoint_model: models/face_keypoints/hrnet/hrnetv2_w18_wflw_256x256_heatmap.onnx
+  sapiens_seg_model: models/face_segmentation/sapiens2_seg/sapiens2_seg_0.4b_fp32.onnx
+  sapiens_pose_model: models/face_keypoints/sapiens2_pose/sapiens2_pose_0.4b_fp32.onnx
   onnx_provider: cuda
 
 pipeline:
+  # Target-region provider used by the integrated pipeline.
+  # --manual-roi temporarily replaces this stage only.
+  # target_locator: face_detection | sapiens_seg
+  target_locator: face_detection
+  # Used after every target locator, including --manual-roi.
+  # keypoint_model: hrnet | sapiens_pose
+  keypoint_model: hrnet
+  # true: keep only the Sapiens model(s) selected above resident.
+  # false: unload selected Sapiens models between stages; small YOLO/HRNet
+  # models remain resident.
+  keep_sapiens_models_resident: true
   # Number of camera frames whose face detections run concurrently. Reduce to
   # 2 or 4 when multiple CUDA detector sessions exceed available GPU memory.
   detection_frames: 4
+  # Number of frames captured as one manual-ROI batch and registered concurrently.
+  manual_roi_frames: 8
+  # Each frame is already an independent global-registration hypothesis.
+  # One RANSAC+ICP attempt per frame avoids 8 x 12 redundant attempts.
+  manual_roi_global_attempts: 1
 
 registration:
   voxel_size_mm: 5.0
@@ -39,7 +57,8 @@ model_keypoints:
 
 camera_keypoints:
   # triplet_vote preserves the existing 3-point combination voting solver.
-  # overdetermined_svd performs one least-squares SVD using every matched point.
+  # overdetermined_svd matches points by keypoint name/index, performs SVD,
+  # clips pairs above keypoint_inlier_threshold_mm, then refines with SVD.
   pose_solver: triplet_vote
   extraction_min_valid_3d_keypoints: 3
   pose_min_inlier_keypoints: 5

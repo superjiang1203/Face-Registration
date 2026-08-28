@@ -231,7 +231,8 @@ ModelKeypointAnnotationService::ModelKeypointAnnotationService(FaceKeypointServi
     : keypointDetector_(keypointDetector) {}
 
 bool ModelKeypointAnnotationService::isRegistrationKeypoint(const std::string& name) {
-    return name == "nose_root" || name == "nose_tip" ||
+    return name.rfind("sapiens_face_", 0) == 0 ||
+           name == "nose_root" || name == "nose_tip" ||
            name == "right_eye_outer" || name == "right_eye_inner" ||
            name == "left_eye_inner" || name == "left_eye_outer";
 }
@@ -424,23 +425,50 @@ ModelKeypointAnnotationService::PoseEstimate ModelKeypointAnnotationService::est
     }
 
     if (solver == PoseSolver::OverdeterminedSvd) {
-        std::vector<std::size_t> all(source.size());
-        std::iota(all.begin(), all.end(), 0);
-        const auto transform = estimateRigid(source, target, all);
+        std::vector<std::size_t> inliers(source.size());
+        std::iota(inliers.begin(), inliers.end(), 0);
+        auto transform = estimateRigid(source, target, inliers);
         if (!transform || !transform->array().isFinite().all()) {
             result.message = "Overdetermined SVD failed to estimate a finite transform";
             return result;
         }
+
+        // Sapiens supplies many correspondences.  Reject geometrically
+        // inconsistent predictions by their transform residual, then solve
+        // the overdetermined rigid transform again with the retained points.
+        // This needs no ground truth: each residual is the distance between
+        // transformed camera point i and the STL point with the same index.
+        for (int iteration = 0; iteration < 2; ++iteration) {
+            std::vector<std::size_t> clipped;
+            clipped.reserve(inliers.size());
+            for (const std::size_t index : inliers) {
+                if (pointError(*transform, source[index], target[index]) <=
+                    inlierThresholdMm)
+                    clipped.push_back(index);
+            }
+            if (clipped.size() < 3) {
+                result.message = "Overdetermined SVD retained fewer than 3 consistent keypoints";
+                return result;
+            }
+            const auto refined = estimateRigid(source, target, clipped);
+            if (!refined || !refined->array().isFinite().all()) {
+                result.message = "Overdetermined SVD refinement failed";
+                return result;
+            }
+            inliers = std::move(clipped);
+            transform = refined;
+        }
+
         double sumSquared = 0.0;
-        for (std::size_t i = 0; i < source.size(); ++i) {
-            const double residual = pointError(*transform, source[i], target[i]);
+        for (const std::size_t index : inliers) {
+            const double residual = pointError(*transform, source[index], target[index]);
             sumSquared += residual * residual;
         }
-        result.inlierCount = static_cast<int>(source.size());
-        result.rmseMm = std::sqrt(sumSquared / static_cast<double>(source.size()));
+        result.inlierCount = static_cast<int>(inliers.size());
+        result.rmseMm = std::sqrt(sumSquared / static_cast<double>(inliers.size()));
         result.cameraToModel = *transform;
         result.success = true;
-        result.message = "ok_overdetermined_svd";
+        result.message = "ok_overdetermined_svd_residual_clipped";
         return result;
     }
 

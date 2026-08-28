@@ -365,8 +365,6 @@ RegistrationResult PointCloudRegistration::alignClouds(
             metrics << "initialization_method=" << result.initializationMethod << '\n'
                     << "used_initial_transformation=" << (result.usedInitialTransformation ? 1 : 0) << '\n';
             addTiming("result_files_write", stageStart);
-            for (const auto& timing : result.stageTimingsMs)
-                metrics << "timing_" << timing.first << "_ms=" << timing.second << '\n';
             metrics.flush();
             if (!metrics)
                 throw std::runtime_error("cannot write aligned metrics output");

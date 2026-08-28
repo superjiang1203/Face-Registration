@@ -118,16 +118,16 @@ add_executable(face_registration_cli app/RegistrationCli.cpp)
 target_link_libraries(face_registration_cli PRIVATE face_registration)
 
 add_executable(face_camera_pipeline app/CameraPipeline.cpp)
-target_link_libraries(face_camera_pipeline PRIVATE face_registration)
+target_link_libraries(face_camera_pipeline PRIVATE face_registration face_segmentation face_pose)
 
-add_executable(orbbec_depth_preview app/OrbbecDepthPreview.cpp)
-target_link_libraries(orbbec_depth_preview PRIVATE face_camera)
+add_executable(manual_roi app/ManualRoi.cpp)
+target_link_libraries(manual_roi PRIVATE face_camera)
 
-add_executable(orbbec_sapiens_seg app/OrbbecSapiensSeg.cpp)
-target_link_libraries(orbbec_sapiens_seg PRIVATE face_camera face_segmentation face_detection)
+add_executable(sapiens_seg app/OrbbecSapiensSeg.cpp)
+target_link_libraries(sapiens_seg PRIVATE face_camera face_segmentation face_detection)
 
-add_executable(sapiens2_pose_onnx_test app/Sapiens2PoseOnnxTest.cpp)
-target_link_libraries(sapiens2_pose_onnx_test PRIVATE face_pose)
+add_executable(sapiens_pose app/SapiensPose.cpp)
+target_link_libraries(sapiens_pose PRIVATE face_pose)
 
 if(WIN32)
   file(GLOB FACE_RUNTIME_DLLS
@@ -138,9 +138,9 @@ if(WIN32)
   foreach(FACE_EXECUTABLE
       face_registration_cli
       face_camera_pipeline
-      orbbec_depth_preview
-      orbbec_sapiens_seg
-      sapiens2_pose_onnx_test)
+      manual_roi
+      sapiens_seg
+      sapiens_pose)
     add_custom_command(TARGET ${FACE_EXECUTABLE} POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E copy_if_different
         ${FACE_RUNTIME_DLLS}
@@ -151,10 +151,10 @@ if(WIN32)
       COMMAND_EXPAND_LISTS)
   endforeach()
 
-  add_custom_command(TARGET orbbec_sapiens_seg POST_BUILD
+  add_custom_command(TARGET sapiens_seg POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory
       "${THIRDPARTY_DIR}/OrbbecSDK/bin/extensions"
-      "$<TARGET_FILE_DIR:orbbec_sapiens_seg>/extensions")
+      "$<TARGET_FILE_DIR:sapiens_seg>/extensions")
 
   add_custom_command(TARGET face_camera_pipeline POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory
@@ -171,6 +171,6 @@ if(WIN32)
 endif()
 
 install(TARGETS face_camera face_detection face_segmentation face_pose face_registration
-  face_registration_cli face_camera_pipeline orbbec_sapiens_seg sapiens2_pose_onnx_test)
+  face_registration_cli face_camera_pipeline manual_roi sapiens_seg sapiens_pose)
 install(DIRECTORY hpp/ DESTINATION include)
 install(DIRECTORY config/ DESTINATION share/face_registration/config)

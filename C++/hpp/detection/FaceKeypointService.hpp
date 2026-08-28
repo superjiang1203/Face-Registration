@@ -31,7 +31,9 @@ class FaceKeypointService {
         std::vector<float> values;
     };
 
-    explicit FaceKeypointService(std::string modelPath = {});
+    explicit FaceKeypointService(std::string modelPath = {},
+                                 bool preferCuda = false,
+                                 int deviceId = 0);
     ~FaceKeypointService() = default;
 
     bool ensureLoaded(std::string* error = nullptr);
@@ -56,6 +58,8 @@ class FaceKeypointService {
     std::unique_ptr<Ort::Env> env_;
     std::unique_ptr<Ort::Session> session_;
     std::string modelPath_;
+    bool preferCuda_ = false;
+    int deviceId_ = 0;
     bool usingCuda_ = false;
     bool inputIsNhwc_ = false;
     int inputWidth_ = 256;

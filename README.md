@@ -22,15 +22,17 @@
 ### 1.2 手动 ROI 配准
 
 ```text
-采集 N 帧
-→ 读取 manual_roi.txt
+采集一帧对齐的 RGB、深度和有序点云
+→ 弹出 RGB 窗口并交互选择 ROI
+→ 写入 output/时间戳/roi/manual_roi.txt
 → 裁剪 ROI 三维点云
-→ FPFH 特征
-→ RANSAC 几何粗配准
+→ 按 runtime.yml 选择 HRNet 或 Sapiens Pose
+→ 相机/STL 同名或同索引关键点求粗变换
 → 多尺度 ICP
+→ 关键点不足时回退 FPFH + RANSAC + ICP
 ```
 
-该分支不加载 Face Detection 和 HRNet 模型。
+该模式只用手动框替代目标定位，关键点、粗配准和 ICP 仍属于同一条流水线。
 
 ### 1.3 Sapiens2 Seg + Pose
 
@@ -102,9 +104,9 @@ Release 可执行文件位于 `build/C++/Release/`：
 ```text
 face_camera_pipeline.exe
 face_registration_cli.exe
-orbbec_depth_preview.exe
-orbbec_sapiens_seg.exe
-sapiens2_pose_onnx_test.exe
+manual_roi.exe
+sapiens_seg.exe
+sapiens_pose.exe
 ```
 
 ## 4. 调用算法 1.1
@@ -116,10 +118,59 @@ runtime:
   onnx_provider: cuda
 
 pipeline:
+  target_locator: face_detection
+  keypoint_model: hrnet
   detection_frames: 4
 
 camera_keypoints:
   pose_solver: triplet_vote
+```
+
+主配准流水线支持四种组合。命令行参数会临时覆盖 YAML：
+
+正常运行只需要配置文件；模型路径、输出目录和算法分支均从 YAML 读取：
+
+```powershell
+.\build\C++\Release\face_camera_pipeline.exe --config ".\C++\config\runtime.yml"
+```
+
+手动 ROI 只增加一个开关：
+
+```powershell
+.\build\C++\Release\face_camera_pipeline.exe --config ".\C++\config\runtime.yml" --manual-roi
+```
+
+相机后端、SN、分辨率和 FPS 默认读取 `C++/config/camera.yml`。其余命令行参数只作为临时覆盖保留。
+
+| 目标定位 | 关键点 | 参数组合 |
+|---|---|---|
+| YOLO Face Detection | HRNet-WFLW | `--target-locator face_detection --keypoint-provider hrnet` |
+| YOLO Face Detection | Sapiens Pose | `--target-locator face_detection --keypoint-provider sapiens_pose` |
+| Sapiens Seg | HRNet-WFLW | `--target-locator sapiens_seg --keypoint-provider hrnet` |
+| Sapiens Seg | Sapiens Pose | `--target-locator sapiens_seg --keypoint-provider sapiens_pose` |
+
+作用：使用 Face Detection 定位目标，使用 HRNet 关键点初始化 SVD/ICP。
+
+```powershell
+.\build\C++\Release\face_camera_pipeline.exe --config ".\C++\config\runtime.yml" --target-locator face_detection --keypoint-provider hrnet --threads 4 --camera-backend orbbec --camera-sn CP2AB53000CK ".\models\face_detection\yolo_face\yolov12n-face.onnx" ".\models\face_keypoints\hrnet\hrnetv2_w18_wflw_256x256_heatmap.onnx" ".\output"
+```
+
+作用：使用 Face Detection 定位目标，使用 Sapiens Pose 稠密脸部点执行超定 SVD/ICP。
+
+```powershell
+.\build\C++\Release\face_camera_pipeline.exe --config ".\C++\config\runtime.yml" --target-locator face_detection --keypoint-provider sapiens_pose --threads 4 --camera-backend orbbec --camera-sn CP2AB53000CK ".\models\face_detection\yolo_face\yolov12n-face.onnx" - ".\output"
+```
+
+作用：使用 Sapiens Seg 定位目标 mask，使用 HRNet 关键点初始化 SVD/ICP。
+
+```powershell
+.\build\C++\Release\face_camera_pipeline.exe --config ".\C++\config\runtime.yml" --target-locator sapiens_seg --keypoint-provider hrnet --threads 4 --camera-backend orbbec --camera-sn CP2AB53000CK - ".\models\face_keypoints\hrnet\hrnetv2_w18_wflw_256x256_heatmap.onnx" ".\output"
+```
+
+作用：使用 Sapiens Seg 定位目标 mask，使用 Sapiens Pose 稠密脸部点执行超定 SVD/ICP。
+
+```powershell
+.\build\C++\Release\face_camera_pipeline.exe --config ".\C++\config\runtime.yml" --target-locator sapiens_seg --keypoint-provider sapiens_pose --threads 4 --camera-backend orbbec --camera-sn CP2AB53000CK - - ".\output"
 ```
 
 `pose_solver` 可设为 `triplet_vote` 或 `overdetermined_svd`，修改配置后不需要重新编译。
@@ -146,22 +197,42 @@ camera_keypoints:
 
 ## 5. 调用算法 1.2
 
-手动 ROI 固定读取 `output/manual_roi.txt`：
-
-```text
-x y width height
-```
-
-作用：显示 Orbbec RGB/深度画面并交互选择 ROI，结果固定写入 `output/manual_roi.txt`。
+作用：单独验证 ROI 窗口和 txt 输出，不执行配准。
 
 ```powershell
-.\build\C++\Release\orbbec_depth_preview.exe --camera-sn CP2AB53000CK --output ".\output\manual_roi.txt"
+.\build\C++\Release\manual_roi.exe --camera-sn CP2AB53000CK --output ".\output\manual_roi.txt"
 ```
 
-作用：跳过检测和关键点，直接执行手动 ROI、FPFH、RANSAC 和 ICP。
+作用：在完整配准程序中弹窗选择 ROI，自动写入当前时间戳目录，然后按照 `runtime.yml` 的 `keypoint_model` 执行关键点、粗配准和 ICP。
 
 ```powershell
-.\build\C++\Release\face_camera_pipeline.exe --config ".\C++\config\runtime.yml" --manual-roi --threads 4 --camera-backend orbbec --camera-sn CP2AB53000CK - - ".\output"
+.\build\C++\Release\face_camera_pipeline.exe --config ".\C++\config\runtime.yml" --manual-roi --camera-backend orbbec --camera-sn CP2AB53000CK - - ".\output"
+```
+
+窗口中拖动鼠标选择人脸，按 Enter 或空格确认，按 ESC 取消（C 可清除当前框）。确认后才开始总计时；默认先按 `camera.yml` 的分辨率和 FPS 采集 8 帧，再并发处理。每帧默认只执行 1 次 FPFH/RANSAC + ICP，最后优先按 fitness、再按 RMSE/P95 选择最佳结果。帧数和单帧全局尝试数分别由 `pipeline.manual_roi_frames`、`pipeline.manual_roi_global_attempts` 控制。
+
+### Windows/Linux 算法脚本
+
+`C++/scripts/windows` 和 `C++/scripts/linux` 均只保留以下三个同名入口：
+
+- `run_face_detection`：Face Detection 定位，关键点模型读取配置。
+- `run_face_keypoints`：弹出手动 ROI，单独验证配置指定的关键点分支并继续配准。
+- `run_face_segmentation`：Sapiens Seg 定位，关键点模型读取配置。
+
+Windows 示例：
+
+```powershell
+.\C++\scripts\windows\run_face_detection.ps1 -CameraSn CP2AB53000CK
+.\C++\scripts\windows\run_face_keypoints.ps1 -CameraSn CP2AB53000CK
+.\C++\scripts\windows\run_face_segmentation.ps1 -CameraSn CP2AB53000CK
+```
+
+Linux 示例：
+
+```bash
+CAMERA_SN=CP2AB53000CK bash C++/scripts/linux/run_face_detection.sh
+CAMERA_SN=CP2AB53000CK bash C++/scripts/linux/run_face_keypoints.sh
+CAMERA_SN=CP2AB53000CK bash C++/scripts/linux/run_face_segmentation.sh
 ```
 
 ## 6. 调用算法 1.3
@@ -171,13 +242,13 @@ x y width height
 作用：从 Orbbec 拍摄 RGB/深度，运行 Sapiens2 Seg，在 500–600 mm 中定位目标并输出 RGB 和 `target_face_mask.png`。
 
 ```powershell
-.\build\C++\Release\orbbec_sapiens_seg.exe --model ".\models\face_segmentation\sapiens2_seg\sapiens2_seg_0.4b_fp32.onnx" --camera-sn CP2AB53000CK --min-depth-mm 500 --max-depth-mm 600 --warmup 15 --no-hrnet --output ".\output\sapiens2_pose_live\capture"
+.\build\C++\Release\sapiens_seg.exe --model ".\models\face_segmentation\sapiens2_seg\sapiens2_seg_0.4b_fp32.onnx" --camera-sn CP2AB53000CK --min-depth-mm 500 --max-depth-mm 600 --warmup 15 --no-hrnet --output ".\output\sapiens2_pose_live\capture"
 ```
 
 作用：读取上一条命令产生的 RGB 和 mask，运行 Sapiens2 Pose，并输出全部脸部关键点和未遮挡脸部关键点。
 
 ```powershell
-.\build\C++\Release\sapiens2_pose_onnx_test.exe ".\models\face_keypoints\sapiens2_pose\sapiens2_pose_0.4b_fp32.onnx" ".\output\sapiens2_pose_live\capture\color.png" ".\output\sapiens2_pose_live\capture\target_face_mask.png" ".\output\sapiens2_pose_live\pose" 0.25 0.20 5
+.\build\C++\Release\sapiens_pose.exe ".\models\face_keypoints\sapiens2_pose\sapiens2_pose_0.4b_fp32.onnx" ".\output\sapiens2_pose_live\capture\color.png" ".\output\sapiens2_pose_live\capture\target_face_mask.png" ".\output\sapiens2_pose_live\pose" 0.25 0.20 5
 ```
 
 三个末尾参数依次表示 Pose score 阈值、mask 邻域覆盖率阈值和邻域半径像素数。
@@ -199,7 +270,9 @@ output/YYYY-MM-DD_HH-MM-SS-ms/
 - `camera/aligned_camera_face.ply`：配准后的相机点云。
 - `STL/camera_to_stl_transformation.txt`：相机坐标到 STL 坐标的 4×4 变换。
 - `STL/pose_stl_to_camera.txt`：STL 坐标到相机坐标的 4×4 变换。
-- `logs/pipeline_timing.txt`：Detection、Keypoints、FPFH、RANSAC、ICP 和总耗时。
+- `logs/registration_timing.txt`：输出完整墙钟阶段以及配准内部明细。自动分支可用“目标定位 + registration_batch_wall + pipeline_control_overhead”核对总时间；手动分支可用“capture_batch + registration_batch_wall + pipeline_control_overhead”核对总时间。`detail_batch_max_*` 是并发帧的单阶段最大值，属于 registration_batch_wall 内部，不能再次与总时间相加。
+
+总耗时是墙钟时间，因此还包含相机采集、点云裁剪/滤波/降采样、法向估计、FPFH、RANSAC 和质量评估；这些过程按输出约定不单独打印，所以分项之和可以小于总耗时。手动 ROI 的交互等待不计入总耗时。
 - `registration_total_excluding_initial_model_reconstruction`：不包含首次 STL 表面点云重建的总时间。
 
 算法 1.3 主要输出：

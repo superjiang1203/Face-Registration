@@ -5,14 +5,18 @@
 #endif
 #include "detection/FaceDetectionService.hpp"
 #include "detection/FaceKeypointService.hpp"
+#include "pose/Sapiens2PoseEstimator.hpp"
 #include "registration/CameraFaceKeypointExtractionService.hpp"
 #include "registration/FaceCandidateSelectionPolicy.hpp"
 #include "registration/FacePointCloudCropService.hpp"
 #include "registration/HeadSurfaceCache.hpp"
 #include "registration/ModelKeypointAnnotationService.hpp"
 #include "registration/PointCloudRegistration.hpp"
+#include "registration/StlModelRenderer.hpp"
+#include "segmentation/Sapiens2Segmenter.hpp"
 
 #include <open3d/Open3D.h>
+#include <opencv2/highgui.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 #include <algorithm>
@@ -28,6 +32,8 @@
 #include <iomanip>
 #include <iostream>
 #include <memory>
+#include <map>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -44,6 +50,19 @@ std::string trim(std::string value) {
     if (first == std::string::npos) return {};
     const auto last = value.find_last_not_of(" \t\r\n");
     return value.substr(first, last - first + 1);
+}
+
+std::optional<bool> parseYamlBool(std::string value) {
+    value = trim(std::move(value));
+    std::transform(value.begin(), value.end(), value.begin(),
+        [](unsigned char character) {
+            return static_cast<char>(std::tolower(character));
+        });
+    if (value == "true" || value == "yes" || value == "on" || value == "1")
+        return true;
+    if (value == "false" || value == "no" || value == "off" || value == "0")
+        return false;
+    return std::nullopt;
 }
 
 std::optional<std::string> readYamlScalar(
@@ -84,13 +103,39 @@ void reportTiming(
     const std::string& stage,
     double milliseconds,
     int frameIndex = -1) {
-    std::ostringstream line;
-    line << std::fixed << std::setprecision(3) << "[timing] ";
-    if (frameIndex >= 0) line << "frame=" << frameIndex << ' ';
-    line << "stage=" << stage << " elapsed_ms=" << milliseconds;
-    std::cout << line.str() << '\n';
-    std::ofstream output(timingPath, std::ios::app);
-    if (output) output << line.str() << '\n';
+    // Detailed timings remain available internally for aggregation, but the
+    // public pipeline output intentionally contains only the four business
+    // stages written by writeFinalTimings().
+    (void)timingPath;
+    (void)stage;
+    (void)milliseconds;
+    (void)frameIndex;
+}
+
+void writeFinalTimings(const std::filesystem::path& timingPath,
+                       const std::string& localizationStage,
+                       double localizationMs,
+                       const std::string& keypointStage,
+                       double keypointMs,
+                       double svdVotingMs,
+                       double icpIterationsMs,
+                       double totalMs,
+                       const std::vector<std::pair<std::string, double>>& details) {
+    std::ofstream output(timingPath, std::ios::trunc);
+    const auto write = [&](const std::string& stage, double milliseconds) {
+        std::ostringstream line;
+        line << std::fixed << std::setprecision(3)
+             << "[timing] stage=" << stage
+             << " elapsed_ms=" << std::max(0.0, milliseconds);
+        std::cout << line.str() << '\n';
+        if (output) output << line.str() << '\n';
+    };
+    if (!localizationStage.empty()) write(localizationStage, localizationMs);
+    write(keypointStage, keypointMs);
+    write("svd_voting_coarse_registration", svdVotingMs);
+    write("icp_total_iterations", icpIterationsMs);
+    for (const auto& detail : details) write(detail.first, detail.second);
+    write("total_localization_to_registration", totalMs);
 }
 
 cv::Mat visualizeAlignedDepth(const cv::Mat& depthMm) {
@@ -293,6 +338,47 @@ void keepOnlyFilteredPoints(
     }
 }
 
+std::size_t intersectPointCloudWithMask(
+    std::vector<PointXYZ>& filteredPointCloud,
+    const CameraFrame& frame,
+    const cv::Size& colorSize,
+    const cv::Rect& cropBbox,
+    const cv::Mat& fullColorMask,
+    const FacePointCloudCropService& cropper) {
+    if (fullColorMask.empty() || fullColorMask.size() != colorSize) return 0;
+    const auto organized = cropper.cropFacePointCloudOrganized(
+        frame, colorSize, cropBbox);
+    if (!organized || organized->roi.colorRoi.empty() ||
+        organized->roi.pointCloudRoi.empty()) {
+        filteredPointCloud.clear();
+        return 0;
+    }
+
+    cv::Mat mask = fullColorMask(organized->roi.colorRoi);
+    cv::Mat pointMask;
+    cv::resize(mask, pointMask, organized->roi.pointCloudRoi.size(),
+               0.0, 0.0, cv::INTER_NEAREST);
+    std::unordered_set<PointKey, PointKeyHash> allowed;
+    allowed.reserve(organized->validPointCount);
+    for (int y = 0; y < pointMask.rows; ++y) {
+        const auto* maskRow = pointMask.ptr<std::uint8_t>(y);
+        for (int x = 0; x < pointMask.cols; ++x) {
+            if (maskRow[x] == 0) continue;
+            const auto& point = organized->pointCloud[
+                static_cast<std::size_t>(y) * pointMask.cols + x];
+            if (isValidPoint(point)) allowed.insert(makePointKey(point));
+        }
+    }
+    filteredPointCloud.erase(
+        std::remove_if(filteredPointCloud.begin(), filteredPointCloud.end(),
+            [&](const PointXYZ& point) {
+                return !isValidPoint(point) ||
+                       allowed.find(makePointKey(point)) == allowed.end();
+            }),
+        filteredPointCloud.end());
+    return allowed.size();
+}
+
 // Shrinks a face detection box to the core face region used for registration.
 // The detector box typically extends past the chin onto the neck and past the
 // contour onto ears/hair, none of which exist on the STL head model.  Those
@@ -318,6 +404,8 @@ static cv::Rect shrinkFaceBoxForCrop(const cv::Rect& box,
 struct PreparedFaceCandidate {
     FaceDetector::Detection detection;
     cv::Rect cropBbox;
+    cv::Mat semanticMask;
+    std::size_t semanticPixelArea{0};
     std::vector<PointXYZ> points;
     FaceCandidateSelectionPolicy::Metrics metrics;
 };
@@ -352,20 +440,212 @@ std::optional<CameraFaceKeypointExtractionService::Snapshot> snapshotForCandidat
     return snapshot;
 }
 
+std::optional<Eigen::Vector3d> sampleSnapshotPoint(
+    const CameraFaceKeypointExtractionService::Snapshot& snapshot, int x, int y, int radius = 6) {
+    if (snapshot.color.empty() || snapshot.pointCloudWidth <= 0 ||
+        snapshot.pointCloudHeight <= 0) return std::nullopt;
+    const int centerX = std::clamp(cvRound(
+        (static_cast<double>(x) + 0.5) * snapshot.pointCloudWidth /
+        snapshot.color.cols - 0.5), 0, snapshot.pointCloudWidth - 1);
+    const int centerY = std::clamp(cvRound(
+        (static_cast<double>(y) + 0.5) * snapshot.pointCloudHeight /
+        snapshot.color.rows - 0.5), 0, snapshot.pointCloudHeight - 1);
+    const int cloudRadius = cvRound(radius * std::max(
+        static_cast<double>(snapshot.pointCloudWidth) / snapshot.color.cols,
+        static_cast<double>(snapshot.pointCloudHeight) / snapshot.color.rows));
+    for (int r = 0; r <= cloudRadius; ++r) {
+        for (int dy = -r; dy <= r; ++dy) for (int dx = -r; dx <= r; ++dx) {
+            if (r > 0 && std::max(std::abs(dx), std::abs(dy)) != r) continue;
+            const int px = centerX + dx, py = centerY + dy;
+            if (px < 0 || py < 0 || px >= snapshot.pointCloudWidth || py >= snapshot.pointCloudHeight) continue;
+            const auto& point = snapshot.pointCloud[static_cast<std::size_t>(py) * snapshot.pointCloudWidth + px];
+            if (isValidPoint(point)) return Eigen::Vector3d(point.x, point.y, point.z);
+        }
+    }
+    return std::nullopt;
+}
+
+CameraFaceKeypointExtractionService::Result extractSapiensFaceKeypoints(
+    Sapiens2PoseEstimator& estimator,
+    const CameraFaceKeypointExtractionService::Snapshot& snapshot,
+    const std::filesystem::path& outputDirectory,
+    double minScore = 0.25,
+    int pointSearchRadius = 6) {
+    CameraFaceKeypointExtractionService::Result result;
+    const cv::Rect2f box(0.0f, 0.0f, static_cast<float>(snapshot.color.cols),
+                         static_cast<float>(snapshot.color.rows));
+    const auto pose = estimator.infer(snapshot.color, box);
+    cv::Mat rendered = snapshot.color.clone();
+    double scoreSum = 0.0;
+    for (const auto& detected : pose.keypoints) {
+        if (detected.index < 70 || detected.score < minScore ||
+            !std::isfinite(detected.position.x) || !std::isfinite(detected.position.y)) continue;
+        ModelKeypointAnnotationService::Keypoint3D keypoint;
+        keypoint.index = detected.index;
+        keypoint.name = "sapiens_face_" + std::to_string(detected.index);
+        keypoint.score = detected.score;
+        keypoint.imageX = cvRound(detected.position.x);
+        keypoint.imageY = cvRound(detected.position.y);
+        const auto point = sampleSnapshotPoint(
+            snapshot, keypoint.imageX, keypoint.imageY, pointSearchRadius);
+        keypoint.hasPoint = point.has_value();
+        if (point) keypoint.point = *point;
+        result.visibleCount++;
+        if (point) result.validCount++;
+        scoreSum += detected.score;
+        result.keypoints.push_back(keypoint);
+        cv::circle(rendered, {keypoint.imageX, keypoint.imageY}, 2,
+                   point ? cv::Scalar(0, 255, 0) : cv::Scalar(0, 0, 255), -1, cv::LINE_AA);
+    }
+    result.meanScore = result.visibleCount ? scoreSum / result.visibleCount : 0.0;
+    result.success = result.validCount >= 3;
+    result.message = result.success ? "Sapiens face keypoints extracted" : "Not enough Sapiens face 3D points";
+    std::filesystem::create_directories(outputDirectory);
+    result.colorImagePath = outputDirectory / "camera_keypoints_color.png";
+    result.renderImagePath = outputDirectory / "camera_keypoints_render.jpg";
+    result.keypointsJsonPath = outputDirectory / "camera_keypoints.json";
+    cv::imwrite(result.colorImagePath.string(), snapshot.color);
+    cv::imwrite(result.renderImagePath.string(), rendered);
+    std::ofstream json(result.keypointsJsonPath);
+    json << "{\n  \"provider\": \"sapiens_pose\",\n  \"validCount\": " << result.validCount
+         << ",\n  \"meanScore\": " << result.meanScore << ",\n  \"keypoints\": [\n";
+    for (std::size_t i = 0; i < result.keypoints.size(); ++i) {
+        const auto& p = result.keypoints[i];
+        json << "    {\"index\":" << p.index << ",\"name\":\"" << p.name
+             << "\",\"score\":" << p.score << ",\"imageX\":" << p.imageX
+             << ",\"imageY\":" << p.imageY << ",\"hasPoint\":" << (p.hasPoint ? "true" : "false");
+        if (p.hasPoint) json << ",\"x\":" << p.point.x() << ",\"y\":" << p.point.y() << ",\"z\":" << p.point.z();
+        json << "}" << (i + 1 == result.keypoints.size() ? "\n" : ",\n");
+    }
+    json << "  ]\n}\n";
+    return result;
+}
+
+ModelKeypointAnnotationService::Result annotateSapiensModelKeypoints(
+    Sapiens2PoseEstimator& estimator,
+    const std::filesystem::path& stlPath,
+    const std::filesystem::path& outputDirectory) {
+    ModelKeypointAnnotationService::Result result;
+    result.stlPath = stlPath;
+    StlModelRenderer renderer;
+    std::string error;
+    if (!renderer.loadStl(stlPath, &error)) { result.message = error; return result; }
+    StlModelRenderer::RenderOptions options;
+    options.azimuthDeg = 0.0;
+    options.elevationDeg = 0.0;
+    const auto render = renderer.render(options, &error);
+    if (render.bgr.empty()) { result.message = error; return result; }
+    result.renderedViewCount = 1;
+    const auto pose = estimator.infer(render.bgr,
+        cv::Rect2f(0, 0, static_cast<float>(render.bgr.cols), static_cast<float>(render.bgr.rows)));
+    cv::Mat visual = render.bgr.clone();
+    for (const auto& detected : pose.keypoints) {
+        if (detected.index < 70 || detected.score < 0.25f) continue;
+        ModelKeypointAnnotationService::Keypoint3D keypoint;
+        keypoint.index = detected.index;
+        keypoint.name = "sapiens_face_" + std::to_string(detected.index);
+        keypoint.score = detected.score;
+        keypoint.imageX = cvRound(detected.position.x);
+        keypoint.imageY = cvRound(detected.position.y);
+        cv::Point sampled;
+        const auto world = renderer.worldPointFromPixel(
+            render, keypoint.imageX, keypoint.imageY, 6, &sampled);
+        keypoint.hasPoint = world.has_value();
+        if (world) {
+            keypoint.point = Eigen::Vector3d((*world)[0], (*world)[1], (*world)[2]);
+            keypoint.imageX = sampled.x; keypoint.imageY = sampled.y;
+            result.namedValidCount++;
+            cv::circle(visual, sampled, 2, {0, 255, 0}, -1, cv::LINE_AA);
+        }
+        result.keypoints.push_back(keypoint);
+    }
+    result.success = result.namedValidCount >= 3;
+    result.message = result.success ? "ok" : "Not enough Sapiens model face points";
+    std::filesystem::create_directories(outputDirectory);
+    result.renderImagePath = outputDirectory / "model_keypoints_render.png";
+    cv::imwrite(result.renderImagePath.string(), visual);
+    return result;
+}
+
 bool writeMatrix(const std::filesystem::path& path, const Eigen::Matrix4d& matrix) {
     std::ofstream output(path, std::ios::trunc);
     if (output) output << std::setprecision(12) << matrix << '\n';
     return static_cast<bool>(output);
 }
 
-std::filesystem::path resolveManualRoiPath() {
-    return std::filesystem::path("output") / "manual_roi.txt";
+struct ManualRoiSelection {
+    CameraFrame frame;
+    cv::Rect roi;
+};
+
+std::optional<ManualRoiSelection> selectManualRoi(
+    CameraBase& camera, const std::filesystem::path& roiDirectory) {
+    std::optional<CameraFrame> selectedFrame;
+    for (int attempt = 0; attempt < 60; ++attempt) {
+        auto frame = camera.capture();
+        if (frame && !frame->color.empty() && !frame->pointCloud.empty()) {
+            selectedFrame = std::move(*frame);
+            break;
+        }
+    }
+    if (!selectedFrame) return std::nullopt;
+
+    struct SelectionState {
+        bool drawing{false};
+        cv::Point start;
+        cv::Rect roi;
+    } state;
+    const std::string windowName = "Manual ROI - ENTER/SPACE confirm, ESC cancel";
+    cv::namedWindow(windowName, cv::WINDOW_NORMAL);
+    cv::setMouseCallback(windowName,
+        [](int event, int x, int y, int, void* data) {
+            auto& selection = *static_cast<SelectionState*>(data);
+            if (event == cv::EVENT_LBUTTONDOWN) {
+                selection.drawing = true;
+                selection.start = {x, y};
+                selection.roi = {};
+            } else if ((event == cv::EVENT_MOUSEMOVE && selection.drawing) ||
+                       (event == cv::EVENT_LBUTTONUP && selection.drawing)) {
+                const int left = std::min(selection.start.x, x);
+                const int top = std::min(selection.start.y, y);
+                selection.roi = {left, top, std::abs(x - selection.start.x),
+                                 std::abs(y - selection.start.y)};
+                if (event == cv::EVENT_LBUTTONUP) selection.drawing = false;
+            }
+        }, &state);
+    bool confirmed = false;
+    for (;;) {
+        cv::Mat display = selectedFrame->color.clone();
+        if (!state.roi.empty())
+            cv::rectangle(display, state.roi, cv::Scalar(0, 255, 0), 2);
+        cv::imshow(windowName, display);
+        const int key = cv::waitKey(16) & 0xff;
+        if (key == 27) break;
+        if ((key == 13 || key == 32) && !state.roi.empty()) {
+            confirmed = true;
+            break;
+        }
+        if (key == 'c' || key == 'C') state.roi = {};
+    }
+    cv::destroyWindow(windowName);
+    const cv::Rect roi = state.roi & cv::Rect(0, 0,
+        selectedFrame->color.cols, selectedFrame->color.rows);
+    if (!confirmed || roi.empty()) return std::nullopt;
+
+    std::filesystem::create_directories(roiDirectory);
+    std::ofstream output(roiDirectory / "manual_roi.txt", std::ios::trunc);
+    if (!output) return std::nullopt;
+    output << roi.x << ' ' << roi.y << ' ' << roi.width << ' ' << roi.height << '\n';
+    cv::imwrite((roiDirectory / "manual_roi_color.png").string(),
+                selectedFrame->color(roi).clone());
+    if (!selectedFrame->depth.empty() && selectedFrame->depth.size() == selectedFrame->color.size())
+        cv::imwrite((roiDirectory / "manual_roi_depth_raw.png").string(),
+                    selectedFrame->depth(roi).clone());
+    return ManualRoiSelection{std::move(*selectedFrame), roi};
 }
 }
 
 int main(int argc, char** argv) {
-    const auto registrationTotalStart = Clock::now();
-    double excludedInitialModelReconstructionMs = 0.0;
     std::string cameraBackend = "orbbec";
     CameraDeviceSelector cameraSelector;
     bool laserAutoControl = false;
@@ -374,19 +654,27 @@ int main(int argc, char** argv) {
     bool manualRoiMode = false;
     unsigned workerCount = 0;
     bool workerCountSpecified = false;
+    bool cameraBackendSpecified = false;
+    bool cameraSnSpecified = false;
+    bool cameraIpSpecified = false;
+    bool laserAutoSpecified = false;
+    bool laserPowerSpecified = false;
     std::filesystem::path runtimeConfig = "C++/config/runtime.yml";
+    std::optional<std::string> targetLocatorOverride;
+    std::optional<std::string> keypointProviderOverride;
     std::vector<std::string> positional;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if ((arg == "--camera-backend" || arg == "--camera-sn" || arg == "--camera-ip" ||
-             arg == "--laser-power" || arg == "--laser-auto" || arg == "--threads") && i + 1 >= argc) {
+             arg == "--laser-power" || arg == "--laser-auto" || arg == "--threads" ||
+             arg == "--target-locator" || arg == "--keypoint-provider") && i + 1 >= argc) {
             std::cerr << "missing value after " << arg << '\n';
             return EXIT_FAILURE;
         }
-        if (arg == "--camera-backend") cameraBackend = argv[++i];
-        else if (arg == "--camera-sn") cameraSelector.serialNumber = argv[++i];
-        else if (arg == "--camera-ip") cameraSelector.ipAddress = argv[++i];
-        else if (arg == "--laser-power") laserPower = std::stoi(argv[++i]);
+        if (arg == "--camera-backend") { cameraBackend = argv[++i]; cameraBackendSpecified = true; }
+        else if (arg == "--camera-sn") { cameraSelector.serialNumber = argv[++i]; cameraSnSpecified = true; }
+        else if (arg == "--camera-ip") { cameraSelector.ipAddress = argv[++i]; cameraIpSpecified = true; }
+        else if (arg == "--laser-power") { laserPower = std::stoi(argv[++i]); laserPowerSpecified = true; }
         else if (arg == "--laser-auto") {
             const std::string value = argv[++i];
             if (value != "on" && value != "off") {
@@ -394,11 +682,14 @@ int main(int argc, char** argv) {
                 return EXIT_FAILURE;
             }
             laserAutoControl = value == "on";
+            laserAutoSpecified = true;
         }
         else if (arg == "--threads") {
             workerCount = static_cast<unsigned>(std::stoul(argv[++i]));
             workerCountSpecified = true;
         }
+        else if (arg == "--target-locator") targetLocatorOverride = argv[++i];
+        else if (arg == "--keypoint-provider") keypointProviderOverride = argv[++i];
         else if (arg == "--config") {
             if (i + 1 >= argc) { std::cerr << "missing value after --config\n"; return EXIT_FAILURE; }
             runtimeConfig = argv[++i];
@@ -413,6 +704,21 @@ int main(int argc, char** argv) {
         }
         else positional.push_back(arg);
     }
+    const auto cameraConfigPath = std::filesystem::path("C++") / "config" / "camera.yml";
+    if (!cameraBackendSpecified)
+        cameraBackend = readYamlScalar(cameraConfigPath, "camera", "backend").value_or("orbbec");
+    if (!cameraSnSpecified)
+        cameraSelector.serialNumber = readYamlScalar(
+            cameraConfigPath, "camera", "serial_number").value_or("");
+    if (!cameraIpSpecified)
+        cameraSelector.ipAddress = readYamlScalar(
+            cameraConfigPath, "camera", "ip_address").value_or("");
+    if (!laserAutoSpecified)
+        laserAutoControl = readYamlScalar(cameraConfigPath, "camera", "laser_auto_control")
+            .value_or("false") == "true";
+    if (!laserPowerSpecified)
+        laserPower = std::stoi(readYamlScalar(
+            cameraConfigPath, "camera", "laser_power").value_or("25"));
     if (cameraBackend != "orbbec" && cameraBackend != "vcamera") {
         std::cerr << "invalid camera backend: " << cameraBackend << '\n';
         return EXIT_FAILURE;
@@ -431,29 +737,36 @@ int main(int argc, char** argv) {
     printDevices(cameraBackend, discoveredDevices);
     if (listCameras) return discoveredDevices.empty() ? 2 : EXIT_SUCCESS;
 
-    if (positional.size() < 3 || positional.size() > 7) {
+    if (positional.size() > 7) {
         std::cerr << "Usage: " << argv[0]
                   << " [--camera-backend orbbec|vcamera] [--list-cameras]"
                      " [--camera-sn SN] [--camera-ip IP]"
                      " [--laser-auto on|off] [--laser-power VALUE] [--manual-roi] [--threads N] [--config FILE]"
-                      " <face_detector.onnx|manual:-> <face_keypoints.onnx|manual:-> <output_dir>"
+                     " [--target-locator face_detection|sapiens_seg]"
+                     " [--keypoint-provider hrnet|sapiens_pose]"
+                      " [face_detector.onnx|-] [face_keypoints.onnx|-] [output_dir]"
                       " [min_fitness] [max_inlier_rmse_mm]"
                       " [max_source_rmse_mm] [max_source_p95_mm]\n"
                       "Target STL is fixed to data/head.stl relative to the repository root.\n";
         return EXIT_FAILURE;
     }
-    if (isStlPath(positional[2]) || isPlyPath(positional[2])) {
+    const std::string detectorArgument = positional.size() >= 1 ? positional[0] : "-";
+    const std::string keypointArgument = positional.size() >= 2 ? positional[1] : "-";
+    const std::string outputArgument = positional.size() >= 3 ? positional[2] :
+        readYamlScalar(runtimeConfig, "runtime", "output_directory").value_or("output");
+    if (isStlPath(outputArgument) || isPlyPath(outputArgument)) {
         std::cerr << "legacy camera command detected: the third positional argument ('"
-                  << positional[2]
+                  << outputArgument
                   << "') looks like the removed <target.ply|stl> argument. Remove it; "
                      "the live target is fixed to data/head.stl.\n";
         return EXIT_FAILURE;
     }
-    const auto requestedOutput = std::filesystem::absolute(positional[2]).lexically_normal();
-    const auto fixedOutput = std::filesystem::absolute("output").lexically_normal();
+    const auto requestedOutput = std::filesystem::absolute(outputArgument).lexically_normal();
+    const auto fixedOutput = std::filesystem::absolute(
+        readYamlScalar(runtimeConfig, "runtime", "output_directory").value_or("output")).lexically_normal();
     if (requestedOutput != fixedOutput) {
         std::cerr << "camera pipeline output is fixed to " << fixedOutput.string()
-                  << "; replace output argument '" << positional[2] << "' with .\\output\n";
+                  << "; use the runtime.output_directory value\n";
         return EXIT_FAILURE;
     }
 
@@ -483,30 +796,39 @@ int main(int argc, char** argv) {
     const std::filesystem::path outputRoot = fixedOutput;
     const std::filesystem::path outputDir = createSessionDirectory(outputRoot);
     const auto faceDetectionDir = outputDir / "face_detection";
+    const auto faceSegmentationDir = outputDir / "face_segmentation";
     const auto faceKeypointsDir = outputDir / "face_keypoints_detection";
     const auto roiDir = outputDir / "roi";
     const auto cameraDir = outputDir / "camera";
     const auto stlDir = outputDir / "STL";
     const auto logsDir = outputDir / "logs";
-    for (const auto& directory : {faceDetectionDir, faceKeypointsDir, roiDir,
-                                  cameraDir, stlDir, logsDir})
+    for (const auto& directory : {faceKeypointsDir, roiDir, cameraDir, stlDir, logsDir})
         std::filesystem::create_directories(directory);
     const unsigned hardwareThreads = std::max(1u, std::thread::hardware_concurrency());
     if (!workerCountSpecified) {
-        const auto configuredFrames = readYamlScalar(runtimeConfig, "pipeline", "detection_frames");
-        workerCount = configuredFrames
-            ? static_cast<unsigned>(std::stoul(*configuredFrames))
-            : std::min(8u, std::max(1u, hardwareThreads > 2 ? hardwareThreads - 2 : 1u));
+        if (manualRoiMode) {
+            workerCount = static_cast<unsigned>(std::stoul(readYamlScalar(
+                runtimeConfig, "pipeline", "manual_roi_frames").value_or("8")));
+        } else {
+            const auto configuredFrames = readYamlScalar(runtimeConfig, "pipeline", "detection_frames");
+            workerCount = configuredFrames
+                ? static_cast<unsigned>(std::stoul(*configuredFrames))
+                : std::min(8u, std::max(1u, hardwareThreads > 2 ? hardwareThreads - 2 : 1u));
+        }
     }
     if (workerCount == 0 || workerCount > 64) {
         std::cerr << "--threads must be between 1 and 64\n";
         return EXIT_FAILURE;
     }
     const int batchSize = static_cast<int>(workerCount);
-    const double minFitness = positional.size() >= 4 ? std::stod(positional[3]) : 0.90;
-    const double maxInlierRmse = positional.size() >= 5 ? std::stod(positional[4]) : 3.0;
-    const double maxSourceRmse = positional.size() >= 6 ? std::stod(positional[5]) : 6.0;
-    const double maxSourceP95 = positional.size() >= 7 ? std::stod(positional[6]) : 10.0;
+    const double minFitness = positional.size() >= 4 ? std::stod(positional[3]) :
+        std::stod(readYamlScalar(runtimeConfig, "registration", "min_fitness").value_or("0.90"));
+    const double maxInlierRmse = positional.size() >= 5 ? std::stod(positional[4]) :
+        std::stod(readYamlScalar(runtimeConfig, "registration", "max_inlier_rmse_mm").value_or("3.0"));
+    const double maxSourceRmse = positional.size() >= 6 ? std::stod(positional[5]) :
+        std::stod(readYamlScalar(runtimeConfig, "registration", "max_source_to_target_rmse_mm").value_or("6.0"));
+    const double maxSourceP95 = positional.size() >= 7 ? std::stod(positional[6]) :
+        std::stod(readYamlScalar(runtimeConfig, "registration", "max_source_to_target_p95_mm").value_or("10.0"));
     if (!std::isfinite(minFitness) || minFitness < 0.0 || minFitness > 1.0 ||
         !std::isfinite(maxInlierRmse) || !(maxInlierRmse > 0.0) ||
         !std::isfinite(maxSourceRmse) || !(maxSourceRmse > 0.0) ||
@@ -515,7 +837,10 @@ int main(int argc, char** argv) {
         return EXIT_FAILURE;
     }
     const double modelUnitScale = 1.0;
-    const auto timingPath = logsDir / "pipeline_timing.txt";
+    const auto timingPath = logsDir / "registration_timing.txt";
+    double targetLocalizationMs = 0.0;
+    double modelTransitionMs = 0.0;
+    std::optional<Clock::time_point> endToEndStart;
     std::cout << "session output: " << outputDir.string() << '\n';
     {
         std::ofstream sessionInfo(outputDir / "session_info.txt");
@@ -540,6 +865,39 @@ int main(int argc, char** argv) {
     const auto configuredProvider = readYamlScalar(runtimeConfig, "runtime", "onnx_provider");
     detectorOptions.detector.preferCuda = configuredProvider && *configuredProvider == "cuda";
     detectorOptions.draw = false;
+    const std::string targetLocator = targetLocatorOverride.value_or(
+        readYamlScalar(runtimeConfig, "pipeline", "target_locator").value_or("face_detection"));
+    const std::string keypointProvider = keypointProviderOverride.value_or(
+        readYamlScalar(runtimeConfig, "pipeline", "keypoint_model").value_or("hrnet"));
+    const auto residentSetting = parseYamlBool(readYamlScalar(
+        runtimeConfig, "pipeline", "keep_sapiens_models_resident").value_or("false"));
+    if (!residentSetting) {
+        std::cerr << "pipeline.keep_sapiens_models_resident must be a boolean\n";
+        return EXIT_FAILURE;
+    }
+    const bool keepSapiensModelsResident = *residentSetting;
+    if (targetLocator == "sapiens_seg")
+        std::filesystem::create_directories(faceSegmentationDir);
+    else
+        std::filesystem::create_directories(faceDetectionDir);
+    if (targetLocator != "face_detection" && targetLocator != "sapiens_seg") {
+        std::cerr << "pipeline.target_locator must be face_detection or sapiens_seg\n";
+        return EXIT_FAILURE;
+    }
+    if (keypointProvider != "hrnet" && keypointProvider != "sapiens_pose") {
+        std::cerr << "pipeline.keypoint_model must be hrnet or sapiens_pose\n";
+        return EXIT_FAILURE;
+    }
+    const std::string sapiensSegModel = readYamlScalar(runtimeConfig, "runtime", "sapiens_seg_model")
+        .value_or("models/face_segmentation/sapiens2_seg/sapiens2_seg_0.4b_fp32.onnx");
+    const std::string sapiensPoseModel = readYamlScalar(runtimeConfig, "runtime", "sapiens_pose_model")
+        .value_or("models/face_keypoints/sapiens2_pose/sapiens2_pose_0.4b_fp32.onnx");
+    const std::string faceDetectorModel = detectorArgument != "-" ? detectorArgument :
+        readYamlScalar(runtimeConfig, "runtime", "face_detector_model")
+            .value_or("models/face_detection/yolo_face/yolov12n-face.onnx");
+    const std::string faceKeypointModel = keypointArgument != "-" ? keypointArgument :
+        readYamlScalar(runtimeConfig, "runtime", "face_keypoint_model")
+            .value_or("models/face_keypoints/hrnet/hrnetv2_w18_wflw_256x256_heatmap.onnx");
     auto poseSolver = ModelKeypointAnnotationService::PoseSolver::TripletVote;
     double keypointInlierThresholdMm = 15.0;
     if (const auto configuredThreshold = readYamlScalar(
@@ -556,21 +914,41 @@ int main(int argc, char** argv) {
         std::ofstream sessionInfo(outputDir / "session_info.txt", std::ios::app);
         sessionInfo << "face_detection_provider="
                     << (detectorOptions.detector.preferCuda ? "cuda" : "cpu") << '\n'
+                    << "target_locator=" << targetLocator << '\n'
+                    << "keypoint_provider=" << keypointProvider << '\n'
+                    << "keep_sapiens_models_resident="
+                    << (keepSapiensModelsResident ? "true" : "false") << '\n'
                     << "parallel_detection_frames=" << batchSize << '\n'
                     << "keypoint_pose_solver="
                     << (poseSolver == ModelKeypointAnnotationService::PoseSolver::TripletVote
                             ? "triplet_vote" : "overdetermined_svd") << '\n';
     }
     if (manualRoiMode) {
-        std::cout << "manual ROI mode: ONNX detection and RGB keypoint initialization disabled\n";
+        std::cout << "manual ROI mode: interactive ROI replaces target localization; "
+                  << keypointProvider << " keypoints and registration remain enabled\n";
     }
     std::unique_ptr<FaceKeypointService> keypointDetector;
     std::unique_ptr<CameraFaceKeypointExtractionService> cameraKeypointExtractor;
+    std::vector<std::unique_ptr<FaceDetectionService>> residentFaceDetectors;
+    std::unique_ptr<Sapiens2PoseEstimator> sapiensPoseEstimator;
+    std::unique_ptr<Sapiens2Segmenter> sapiensSegmenter;
+    std::mutex sapiensSegMutex;
     std::optional<ModelKeypointAnnotationService::Result> modelKeypoints;
     std::optional<std::string> modelKeypointSourceSha256;
-    if (!manualRoiMode && positional[1] != "-") {
+    const bool keepResidentSeg = !manualRoiMode &&
+        targetLocator == "sapiens_seg" && keepSapiensModelsResident;
+    const bool keepResidentPose = keypointProvider == "sapiens_pose" &&
+        keepSapiensModelsResident;
+    if (keepResidentSeg) {
+        sapiensSegmenter = std::make_unique<Sapiens2Segmenter>(
+            Sapiens2Segmenter::Options{detectorOptions.detector.preferCuda, 0});
+        sapiensSegmenter->load(sapiensSegModel);
+        std::cout << "resident Sapiens model: Seg loaded before STL preprocessing\n";
+    }
+    if (keypointProvider == "hrnet") {
         const auto keypointLoadStart = Clock::now();
-        keypointDetector = std::make_unique<FaceKeypointService>(positional[1]);
+        keypointDetector = std::make_unique<FaceKeypointService>(
+            faceKeypointModel, detectorOptions.detector.preferCuda, 0);
         std::string error;
         if (!keypointDetector->ensureLoaded(&error)) {
             std::cerr << error << '\n';
@@ -622,9 +1000,36 @@ int main(int argc, char** argv) {
                           << error << '\n';
             }
         }
+    } else if (keypointProvider == "sapiens_pose") {
+        const auto loadStart = Clock::now();
+        sapiensPoseEstimator = std::make_unique<Sapiens2PoseEstimator>(
+            Sapiens2PoseEstimator::Options{detectorOptions.detector.preferCuda, 0});
+        sapiensPoseEstimator->load(sapiensPoseModel);
+        reportTiming(timingPath, "sapiens_pose_model_load", elapsedMs(loadStart));
+        const auto annotationSourceBefore = HeadSurfaceCache::digestFile(modelStlPath);
+        const auto modelStart = Clock::now();
+        auto annotation = annotateSapiensModelKeypoints(
+            *sapiensPoseEstimator, modelStlPath, stlDir);
+        reportTiming(timingPath, "stl_sapiens_pose_keypoints", elapsedMs(modelStart));
+        if (annotation.success) {
+            modelKeypointSourceSha256 = annotationSourceBefore.sha256Hex;
+            modelKeypoints = std::move(annotation);
+            poseSolver = ModelKeypointAnnotationService::PoseSolver::OverdeterminedSvd;
+            std::cout << "Sapiens model face keypoints=" << modelKeypoints->namedValidCount
+                      << "; pose solver forced to overdetermined_svd\n";
+        } else {
+            std::cerr << "Sapiens STL keypoints failed; FPFH/RANSAC fallback remains active: "
+                      << annotation.message << '\n';
+        }
     }
 
     RegistrationOptions registrationOptions;
+    const int manualRoiGlobalAttempts = std::stoi(readYamlScalar(
+        runtimeConfig, "pipeline", "manual_roi_global_attempts").value_or("1"));
+    if (manualRoiGlobalAttempts < 1) {
+        std::cerr << "pipeline.manual_roi_global_attempts must be positive\n";
+        return EXIT_FAILURE;
+    }
     registrationOptions.initialFitnessToSkipGlobal = minFitness;
     registrationOptions.initialRmseToSkipGlobalMm = maxInlierRmse;
     registrationOptions.initialSourceToTargetRmseToSkipGlobalMm = maxSourceRmse;
@@ -696,7 +1101,6 @@ int main(int argc, char** argv) {
                 workspace.sourceSnapshotStlPath.string(), workspace.surfacePlyPath.string(),
                 cacheRecipe.reconstruction);
             const double modelReconstructionMs = elapsedMs(reconstructionStart);
-            excludedInitialModelReconstructionMs = modelReconstructionMs;
             reportTiming(timingPath, "head_surface_cloud_generation_excluded_from_total",
                          modelReconstructionMs);
             for (const auto& timing : generated.stageTimingsMs)
@@ -764,9 +1168,32 @@ int main(int argc, char** argv) {
         return EXIT_FAILURE;
     }
 
+    // STL surface reconstruction/cache loading and model-side keypoint
+    // annotation are one startup-preprocessing phase. Only after every STL
+    // artifact is ready do we release the keypoint provider. None of this is
+    // included in localization-to-registration timing.
+    if (!keepResidentPose)
+        sapiensPoseEstimator.reset();
+    if (!manualRoiMode && targetLocator == "sapiens_seg" && !keepResidentSeg) {
+        sapiensSegmenter = std::make_unique<Sapiens2Segmenter>(
+            Sapiens2Segmenter::Options{detectorOptions.detector.preferCuda, 0});
+        sapiensSegmenter->load(sapiensSegModel);
+    }
+    std::cout << "STL artifacts complete: resident models="
+              << (targetLocator == "face_detection" ? "face_detection" :
+                  keepResidentSeg ? "sapiens_seg" : "none")
+              << ','
+              << (keypointProvider == "hrnet" ? "hrnet" :
+                  keepResidentPose ? "sapiens_pose" : "none") << '\n';
 
     CameraBase::Options cameraOptions;
     cameraOptions.frameKind = FrameKind::ColorDepthPointCloud;
+    if (const auto configuredWidth = readYamlScalar(cameraConfigPath, "camera", "color_width"))
+        cameraOptions.width = std::stoi(*configuredWidth);
+    if (const auto configuredHeight = readYamlScalar(cameraConfigPath, "camera", "color_height"))
+        cameraOptions.height = std::stoi(*configuredHeight);
+    if (const auto configuredFps = readYamlScalar(cameraConfigPath, "camera", "fps"))
+        cameraOptions.fps = std::stod(*configuredFps);
     std::unique_ptr<CameraBase> camera;
     if (cameraBackend == "vcamera") {
 #if FACE_HAS_VCAMERA
@@ -853,34 +1280,41 @@ int main(int argc, char** argv) {
         bool passed{false};
         std::string message;
         cv::Rect bbox;
+        cv::Mat semanticMask;
         double depthMm{0.0};
         std::vector<PointXYZ> sourcePoints;
         std::shared_ptr<open3d::geometry::PointCloud> sourceCloud;
         std::optional<CameraFaceKeypointExtractionService::Result> keypoints;
+        double keypointDetectionMs{0.0};
+        double svdVotingMs{0.0};
+        double icpIterationsMs{0.0};
+        double candidatePreparationMs{0.0};
+        double pointCloudPreparationMs{0.0};
+        bool keypointInitializationAccepted{false};
         RegistrationResult registration;
     };
 
-    if (!manualRoiMode && positional[1] == "-") {
-        std::cerr << "face-detection mode requires a keypoint model\n";
-        camera->close();
-        return EXIT_FAILURE;
-    }
-
     std::optional<cv::Rect> manualRoi;
-    const auto manualRoiPath = resolveManualRoiPath();
     if (manualRoiMode) {
-        std::ifstream input(manualRoiPath);
-        int x = 0, y = 0, width = 0, height = 0;
-        if (!(input >> x >> y >> width >> height) || width <= 0 || height <= 0) {
-            std::cerr << "invalid manual ROI file: " << manualRoiPath.string() << '\n';
+        const auto selection = selectManualRoi(*camera, roiDir);
+        if (!selection) {
+            std::cerr << "manual ROI selection was cancelled or no valid frame was captured\n";
             camera->close();
             return EXIT_FAILURE;
         }
-        manualRoi = cv::Rect(x, y, width, height);
+        manualRoi = selection->roi;
+        // User interaction is deliberately excluded. Timing starts only
+        // after the operator confirms the ROI.
+        targetLocalizationMs = 0.0;
+        endToEndStart = Clock::now();
+        std::cout << "manual ROI saved: " << (roiDir / "manual_roi.txt").string()
+                  << " -> " << manualRoi->x << ',' << manualRoi->y << ','
+                  << manualRoi->width << ',' << manualRoi->height << '\n';
     }
 
     std::vector<CameraFrame> frames;
     frames.reserve(batchSize);
+    const auto captureBatchStart = Clock::now();
     for (int attempt = 0;
          attempt < std::max(30, batchSize * 10) &&
          frames.size() < static_cast<std::size_t>(batchSize);
@@ -889,10 +1323,36 @@ int main(int argc, char** argv) {
         if (!frame || frame->color.empty() || frame->pointCloud.empty()) continue;
         frames.push_back(std::move(*frame));
     }
+    const double captureBatchMs = manualRoiMode ? elapsedMs(captureBatchStart) : 0.0;
     camera->close();
-    if (frames.size() != static_cast<std::size_t>(batchSize)) {
-        std::cerr << "captured " << frames.size() << " of " << batchSize << " frames\n";
+    const std::size_t expectedFrames = static_cast<std::size_t>(batchSize);
+    if (frames.size() != expectedFrames) {
+        std::cerr << "captured " << frames.size() << " of " << expectedFrames << " frames\n";
         return 2;
+    }
+
+    // Load the frame-local YOLO CUDA Sessions immediately before the timed online
+    // stage. No camera wait or branch-specific GPU work occurs between this
+    // common deployment step and the first real detection; no synthetic
+    // inference is executed.
+    if (!manualRoiMode && targetLocator == "face_detection") {
+        residentFaceDetectors.reserve(static_cast<std::size_t>(batchSize));
+        for (int i = 0; i < batchSize; ++i) {
+            auto detector = std::make_unique<FaceDetectionService>(detectorOptions);
+            if (!detector->loadOnnx(faceDetectorModel)) {
+                std::cerr << "cannot preload resident face detector " << i << '\n';
+                return EXIT_FAILURE;
+            }
+            if (detectorOptions.detector.preferCuda && !detector->isUsingCuda()) {
+                std::cerr << "face detector " << i
+                          << " did not attach to the CUDA execution provider\n";
+                return EXIT_FAILURE;
+            }
+            residentFaceDetectors.push_back(std::move(detector));
+        }
+        std::cout << "online model deployment complete: "
+                  << residentFaceDetectors.size()
+                  << " Face Detection CUDA session(s)\n";
     }
 
     struct GlobalDetectionCandidate {
@@ -901,48 +1361,163 @@ int main(int argc, char** argv) {
     };
     std::optional<GlobalDetectionCandidate> globalTopDetection;
     if (!manualRoiMode) {
-        const auto detectionBatchStart = Clock::now();
+        std::vector<double> faceDetectorInferenceMs(frames.size(), 0.0);
+        std::promise<void> detectionStartPromise;
+        const std::shared_future<void> detectionStartSignal =
+            detectionStartPromise.get_future().share();
+        std::vector<std::promise<void>> detectionWorkerReady(frames.size());
+        std::vector<std::future<void>> detectionWorkerReadyFutures;
+        detectionWorkerReadyFutures.reserve(frames.size());
+        for (auto& ready : detectionWorkerReady)
+            detectionWorkerReadyFutures.push_back(ready.get_future());
         std::vector<std::future<std::vector<GlobalDetectionCandidate>>> detectionFutures;
         detectionFutures.reserve(frames.size());
         for (int frameIndex = 0; frameIndex < static_cast<int>(frames.size()); ++frameIndex) {
             detectionFutures.push_back(std::async(std::launch::async, [&, frameIndex]() {
+                detectionWorkerReady[static_cast<std::size_t>(frameIndex)].set_value();
+                detectionStartSignal.wait();
                 std::vector<GlobalDetectionCandidate> accepted;
                 FacePointCloudCropService localCropper(cropOptions);
-                FaceDetectionService detector(detectorOptions);
-                if (!detector.loadOnnx(positional[0])) return accepted;
-                cv::Mat color = frames[static_cast<std::size_t>(frameIndex)].color.clone();
-                const auto detected = detector.process(
-                    color,
-                    frames[static_cast<std::size_t>(frameIndex)].depth,
-                    &frames[static_cast<std::size_t>(frameIndex)].pointCloud,
-                    frames[static_cast<std::size_t>(frameIndex)].pointCloudWidth,
-                    frames[static_cast<std::size_t>(frameIndex)].pointCloudHeight);
-                if (!detected) return accepted;
-                for (const auto& detection : detected->dets) {
+                struct LocatedDetection {
+                    FaceDetector::Detection detection;
+                    cv::Mat semanticMask;
+                    std::size_t semanticPixelArea{0};
+                };
+                std::vector<LocatedDetection> detections;
+                if (targetLocator == "face_detection") {
+                    cv::Mat color = frames[static_cast<std::size_t>(frameIndex)].color.clone();
+                    const auto detected = residentFaceDetectors[
+                        static_cast<std::size_t>(frameIndex)]->process(
+                        color, frames[static_cast<std::size_t>(frameIndex)].depth,
+                        &frames[static_cast<std::size_t>(frameIndex)].pointCloud,
+                        frames[static_cast<std::size_t>(frameIndex)].pointCloudWidth,
+                        frames[static_cast<std::size_t>(frameIndex)].pointCloudHeight);
+                    if (!detected) return accepted;
+                    faceDetectorInferenceMs[static_cast<std::size_t>(frameIndex)] =
+                        detected->inferMs;
+                    detections.reserve(detected->dets.size());
+                    for (const auto& detection : detected->dets)
+                        detections.push_back({detection, {}, 0});
+                } else {
+                    Sapiens2Segmenter::Result segmentation;
+                    {
+                        // A single CUDA session is shared to avoid loading one
+                        // multi-GB Sapiens model per frame.
+                        std::lock_guard<std::mutex> lock(sapiensSegMutex);
+                        segmentation = sapiensSegmenter->infer(
+                            frames[static_cast<std::size_t>(frameIndex)].color);
+                    }
+                    cv::Mat groupingMask;
+                    const cv::Mat groupingKernel = cv::getStructuringElement(
+                        cv::MORPH_ELLIPSE, cv::Size(25, 25));
+                    cv::morphologyEx(segmentation.faceMask, groupingMask,
+                                     cv::MORPH_CLOSE, groupingKernel);
+                    cv::Mat labels, stats, centroids;
+                    const int count = cv::connectedComponentsWithStats(
+                        groupingMask, labels, stats, centroids, 8, CV_32S);
+                    for (int component = 1; component < count; ++component) {
+                        if (stats.at<int>(component, cv::CC_STAT_AREA) < 100) continue;
+                        FaceDetector::Detection detection;
+                        cv::Rect box(
+                            stats.at<int>(component, cv::CC_STAT_LEFT),
+                            stats.at<int>(component, cv::CC_STAT_TOP),
+                            stats.at<int>(component, cv::CC_STAT_WIDTH),
+                            stats.at<int>(component, cv::CC_STAT_HEIGHT));
+                        const int expandX = std::max(8, box.width / 8);
+                        const int expandY = std::max(8, box.height / 8);
+                        detection.bbox = cv::Rect(
+                            box.x - expandX, box.y - expandY,
+                            box.width + 2 * expandX, box.height + 2 * expandY) &
+                            cv::Rect(0, 0,
+                                frames[static_cast<std::size_t>(frameIndex)].color.cols,
+                                frames[static_cast<std::size_t>(frameIndex)].color.rows);
+                        detection.score = 1.0f;
+                        detection.selectionScore = 1.0f;
+                        // Preserve semantic component area for the density
+                        // gate; bbox area includes deliberately expanded
+                        // context and must not be treated as mask area.
+                        cv::Mat topology = labels == component;
+                        cv::Mat visibleComponentMask;
+                        cv::bitwise_and(segmentation.faceMask, topology,
+                                        visibleComponentMask);
+                        const auto visibleArea = static_cast<std::size_t>(
+                            cv::countNonZero(visibleComponentMask));
+                        if (visibleArea < 100) continue;
+                        detections.push_back({detection,
+                            std::move(visibleComponentMask), visibleArea});
+                    }
+                }
+                for (const auto& located : detections) {
+                    const auto& detection = located.detection;
                     const double score = validatedDetectionScore(detection);
                     if (score < faceSelectionOptions.minDetectionScore || detection.bbox.empty()) continue;
                     PreparedFaceCandidate candidate;
                     candidate.detection = detection;
-                    candidate.cropBbox = shrinkFaceBoxForCrop(detection.bbox);
+                    candidate.semanticMask = located.semanticMask;
+                    candidate.semanticPixelArea = located.semanticPixelArea;
+                    candidate.cropBbox = targetLocator == "sapiens_seg"
+                        ? detection.bbox : shrinkFaceBoxForCrop(detection.bbox);
                     candidate.points = localCropper.cropFacePointCloud(
                         frames[static_cast<std::size_t>(frameIndex)],
                         frames[static_cast<std::size_t>(frameIndex)].color.size(),
                         candidate.cropBbox);
+                    if (!candidate.semanticMask.empty()) {
+                        candidate.semanticPixelArea = intersectPointCloudWithMask(
+                            candidate.points,
+                            frames[static_cast<std::size_t>(frameIndex)],
+                            frames[static_cast<std::size_t>(frameIndex)].color.size(),
+                            candidate.cropBbox, candidate.semanticMask, localCropper);
+                    }
                     const auto roi = localCropper.faceCropRoi(
                         frames[static_cast<std::size_t>(frameIndex)].color.size(),
                         frames[static_cast<std::size_t>(frameIndex)].pointCloudWidth,
                         frames[static_cast<std::size_t>(frameIndex)].pointCloudHeight,
                         candidate.cropBbox);
-                    const std::size_t pixels = roi
+                    const std::size_t pixels = targetLocator == "sapiens_seg"
+                        ? candidate.semanticPixelArea
+                        : roi
                         ? static_cast<std::size_t>(std::max(0, roi->pointCloudRoi.area())) : 0;
+                    auto evaluationOptions = faceSelectionOptions;
+                    if (!candidate.semanticMask.empty()) {
+                        // A semantic face mask is much smaller than a
+                        // rectangular detection ROI, especially after depth
+                        // stride/downsampling. Keep the physical geometry
+                        // gates, but use a viable minimum sample count.
+                        evaluationOptions.minPointCount = std::min<std::size_t>(
+                            evaluationOptions.minPointCount, 150);
+                        // The semantic mask intentionally excludes hair and
+                        // separately labelled occluders, so its shorter axis is
+                        // smaller than a detector rectangle.
+                        evaluationOptions.minPlanarSpanMm = std::min(
+                            evaluationOptions.minPlanarSpanMm, 20.0);
+                    }
                     candidate.metrics = FaceCandidateSelectionPolicy::evaluate(
-                        score, candidate.points, pixels, faceSelectionOptions);
+                        score, candidate.points, pixels, evaluationOptions);
+                    if (targetLocator == "sapiens_seg") {
+                        std::cout << "Sapiens Seg candidate: frame=" << frameIndex
+                                  << " bbox=" << candidate.cropBbox.x << ',' << candidate.cropBbox.y
+                                  << ',' << candidate.cropBbox.width << ',' << candidate.cropBbox.height
+                                  << " points=" << candidate.points.size()
+                                  << " depth_mm=" << candidate.metrics.medianDepthMm
+                                  << " span_mm=" << candidate.metrics.xSpanMm << 'x'
+                                  << candidate.metrics.ySpanMm
+                                  << " relief_mm=" << candidate.metrics.depthReliefMm
+                                  << " mad_mm=" << candidate.metrics.depthMadMm
+                                  << " accepted=" << (candidate.metrics.accepted ? "yes" : "no")
+                                  << " reason=" << candidate.metrics.rejectionReason << '\n';
+                    }
                     if (candidate.metrics.accepted)
                         accepted.push_back({frameIndex, std::move(candidate)});
                 }
                 return accepted;
             }));
         }
+        for (auto& ready : detectionWorkerReadyFutures) ready.wait();
+        // All workers are blocked at the same start gate, so async
+        // thread-launch jitter is excluded from localization timing.
+        const auto detectionBatchStart = Clock::now();
+        endToEndStart = detectionBatchStart;
+        detectionStartPromise.set_value();
         std::vector<GlobalDetectionCandidate> allCandidates;
         for (auto& future : detectionFutures) {
             auto candidates = future.get();
@@ -958,15 +1533,46 @@ int main(int argc, char** argv) {
             return left.frameIndex < right.frameIndex;
         });
         if (allCandidates.empty()) {
-            std::cerr << "parallel face detection produced no candidate passing physical gates\n";
+            std::cerr << targetLocator
+                      << " produced no candidate passing physical gates\n";
             return 3;
         }
         globalTopDetection = std::move(allCandidates.front());
-        reportTiming(timingPath, "parallel_face_detection_global_top1", elapsedMs(detectionBatchStart));
-        std::cout << "global detection Top-1: frame=" << globalTopDetection->frameIndex
+        targetLocalizationMs = targetLocator == "face_detection"
+            ? *std::max_element(faceDetectorInferenceMs.begin(),
+                                faceDetectorInferenceMs.end())
+            : elapsedMs(detectionBatchStart);
+        std::cout << "global target Top-1 (" << targetLocator << "): frame=" << globalTopDetection->frameIndex
                   << " score=" << globalTopDetection->candidate.metrics.detectionScore
                   << " depth_mm=" << globalTopDetection->candidate.metrics.medianDepthMm
                   << " accepted_candidates=" << allCandidates.size() << '\n';
+    }
+
+    if (!manualRoiMode && targetLocator == "sapiens_seg" && !keepResidentSeg) {
+        // The selected candidate owns a cloned semantic mask, so the Seg
+        // session is no longer needed. Free it before camera Pose inference.
+        sapiensSegmenter.reset();
+    }
+    if (keypointProvider == "sapiens_pose" && !sapiensPoseEstimator) {
+            const auto poseLoadStart = Clock::now();
+            sapiensPoseEstimator = std::make_unique<Sapiens2PoseEstimator>(
+                Sapiens2PoseEstimator::Options{detectorOptions.detector.preferCuda, 0});
+            sapiensPoseEstimator->load(sapiensPoseModel);
+            modelTransitionMs += elapsedMs(poseLoadStart);
+            std::cout << "camera keypoint stage: Sapiens Pose loaded\n";
+    } else if (keypointProvider == "hrnet" && !cameraKeypointExtractor) {
+        const auto keypointLoadStart = Clock::now();
+        keypointDetector = std::make_unique<FaceKeypointService>(
+            faceKeypointModel, detectorOptions.detector.preferCuda, 0);
+        std::string error;
+        if (!keypointDetector->ensureLoaded(&error)) {
+            std::cerr << error << '\n';
+            return EXIT_FAILURE;
+        }
+        cameraKeypointExtractor =
+            std::make_unique<CameraFaceKeypointExtractionService>(*keypointDetector);
+        modelTransitionMs += elapsedMs(keypointLoadStart);
+        std::cout << "camera keypoint stage: HRNet loaded\n";
     }
 
     const auto processFrame = [&](int frameIndex) -> FrameResult {
@@ -975,6 +1581,7 @@ int main(int argc, char** argv) {
         const CameraFrame& frame = frames[static_cast<std::size_t>(frameIndex)];
         output.sequence = frame.meta.sequence;
         try {
+            const auto candidatePreparationStart = Clock::now();
             FacePointCloudCropService localCropper(cropOptions);
             std::vector<PreparedFaceCandidate> candidates;
 
@@ -1024,55 +1631,89 @@ int main(int argc, char** argv) {
             for (const auto& candidate : candidates) metrics.push_back(candidate.metrics);
             const auto order = FaceCandidateSelectionPolicy::rankNearestFirst(
                 metrics, faceSelectionOptions);
+            output.candidatePreparationMs = elapsedMs(candidatePreparationStart);
 
-            CameraFaceKeypointExtractionService* keypointExtractorForFrame =
-                manualRoiMode ? nullptr : cameraKeypointExtractor.get();
+            const bool useKeypoints = cameraKeypointExtractor || sapiensPoseEstimator;
 
             bool hasResult = false;
             for (const std::size_t index : order) {
                 auto& candidate = candidates[index];
+                const auto pointCloudPreparationStart = Clock::now();
                 open3d::geometry::PointCloud raw;
                 for (const auto& point : candidate.points)
                     raw.points_.emplace_back(point.x, point.y, point.z);
                 auto source = raw.VoxelDownSample(2.5);
                 if (!source || source->IsEmpty()) continue;
+                output.pointCloudPreparationMs += elapsedMs(pointCloudPreparationStart);
 
                 std::optional<Eigen::Matrix4d> initial;
-                if (keypointExtractorForFrame) {
+                double candidateKeypointMs = 0.0;
+                double candidateSvdVotingMs = 0.0;
+                if (useKeypoints) {
                     const auto keypointStart = Clock::now();
                     const auto snapshot = snapshotForCandidate(
                         frame, candidate, localCropper);
                     if (snapshot) {
-                        CameraFaceKeypointExtractionService::Options options;
-                        options.writeVisualizationArtifacts = true;
-                        options.write3DArtifacts = true;
-                        std::string error;
-                        const auto extracted =
-                            keypointExtractorForFrame->extractFromSnapshot(
-                                *snapshot, faceKeypointsDir, options, &error);
+                        const auto keypointOutputDirectory = manualRoiMode
+                            ? faceKeypointsDir / ("frame_" + std::to_string(frameIndex))
+                            : faceKeypointsDir;
+                        CameraFaceKeypointExtractionService::Result extracted;
+                        if (keypointProvider == "hrnet") {
+                            CameraFaceKeypointExtractionService::Options options;
+                            // A semantic mask makes visibility a pixel-level
+                            // decision. Do not let neighbourhood search cross
+                            // from an occluder into an adjacent face pixel.
+                            if (!candidate.semanticMask.empty())
+                                options.searchRadiusPx = 0;
+                            options.writeVisualizationArtifacts = true;
+                            options.write3DArtifacts = true;
+                            std::string error;
+                            extracted = cameraKeypointExtractor->extractFromSnapshot(
+                                *snapshot, keypointOutputDirectory, options, &error);
+                        } else {
+                            extracted = extractSapiensFaceKeypoints(
+                                *sapiensPoseEstimator, *snapshot, keypointOutputDirectory,
+                                0.25, candidate.semanticMask.empty() ? 6 : 0);
+                        }
+                        candidateKeypointMs = elapsedMs(keypointStart);
                         output.keypoints = extracted;
                         if (extracted.success && modelKeypoints) {
+                            const auto svdVotingStart = Clock::now();
                             const auto pose =
                                 ModelKeypointAnnotationService::estimateCameraToModel(
                                     extracted.keypoints, modelKeypoints->keypoints,
                                     keypointInlierThresholdMm,
                                     poseSolver);
+                            candidateSvdVotingMs = elapsedMs(svdVotingStart);
                             if (FaceCandidateSelectionPolicy::isReliableKeypointPose(
                                     pose.success, pose.inlierCount, pose.rmseMm,
                                     extracted.meanScore, faceSelectionOptions))
                                 initial = pose.cameraToModel;
                         }
                     }
-                    reportTiming(timingPath, "face_keypoints_detection_top1",
-                                 elapsedMs(keypointStart));
+                    if (candidateKeypointMs == 0.0)
+                        candidateKeypointMs = elapsedMs(keypointStart);
                 }
 
                 RegistrationOptions options = registrationOptions;
+                if (manualRoiMode)
+                    options.globalAttempts = manualRoiGlobalAttempts;
                 options.randomSeed += frameIndex * 101;
                 options.reseedGlobalRandomEngine = false;
                 PointCloudRegistration registrationForFrame(options);
                 const auto registered = registrationForFrame.alignClouds(
                     *source, *registrationTargetCloud, {}, initial);
+                double candidateIcpMs = 0.0;
+                for (const auto& stage : registered.stageTimingsMs) {
+                    if (stage.first == "keypoint_initial_multiscale_icp" ||
+                        stage.first.rfind("global_icp_attempt_", 0) == 0)
+                        candidateIcpMs += stage.second;
+                }
+                output.keypointDetectionMs += candidateKeypointMs;
+                output.svdVotingMs += candidateSvdVotingMs;
+                output.icpIterationsMs += candidateIcpMs;
+                output.keypointInitializationAccepted =
+                    output.keypointInitializationAccepted || initial.has_value();
                 if (!registered.success) continue;
                 const bool passed =
                     registered.fitness >= minFitness &&
@@ -1090,6 +1731,7 @@ int main(int argc, char** argv) {
                 hasResult = true;
                 output.passed = passed;
                 output.bbox = candidate.detection.bbox;
+                output.semanticMask = candidate.semanticMask.clone();
                 output.depthMm = candidate.metrics.medianDepthMm;
                 output.sourcePoints = candidate.points;
                 output.sourceCloud = std::move(source);
@@ -1102,26 +1744,66 @@ int main(int argc, char** argv) {
         return output;
     };
 
-    std::vector<std::future<FrameResult>> futures;
+    std::vector<FrameResult> results;
     open3d::utility::random::Seed(registrationOptions.randomSeed);
+    const auto registrationBatchStart = Clock::now();
     if (manualRoiMode) {
+        std::cout << "manual ROI: captured batch=" << frames.size()
+                  << "; registering all frames concurrently; camera_fps="
+                  << cameraOptions.fps
+                  << " ransac_icp_attempts_per_frame="
+                  << manualRoiGlobalAttempts << '\n';
+        std::vector<std::future<FrameResult>> futures;
+        futures.reserve(frames.size());
         for (int i = 0; i < static_cast<int>(frames.size()); ++i)
             futures.push_back(std::async(std::launch::async, processFrame, i));
+        results.reserve(futures.size());
+        for (auto& future : futures) results.push_back(future.get());
     } else {
-        futures.push_back(std::async(
-            std::launch::async, processFrame, globalTopDetection->frameIndex));
+        results.push_back(processFrame(globalTopDetection->frameIndex));
     }
-    std::vector<FrameResult> results;
-    for (auto& future : futures) results.push_back(future.get());
+    const double registrationBatchWallMs = elapsedMs(registrationBatchStart);
+    const double endToEndTotalMs = endToEndStart ? elapsedMs(*endToEndStart) : 0.0;
+    double totalKeypointDetectionMs = 0.0;
+    double totalSvdVotingMs = 0.0;
+    double totalIcpIterationsMs = 0.0;
+    double candidatePreparationBatchMaxMs = 0.0;
+    double pointCloudPreparationBatchMaxMs = 0.0;
+    std::map<std::string, double> registrationStageBatchMaxMs;
+    for (const auto& result : results) {
+        // Frames run concurrently, so batch stage latency follows the slowest
+        // frame rather than the arithmetic sum of all worker durations.
+        totalKeypointDetectionMs = std::max(
+            totalKeypointDetectionMs, result.keypointDetectionMs);
+        totalSvdVotingMs = std::max(totalSvdVotingMs, result.svdVotingMs);
+        totalIcpIterationsMs = std::max(
+            totalIcpIterationsMs, result.icpIterationsMs);
+        candidatePreparationBatchMaxMs = std::max(
+            candidatePreparationBatchMaxMs, result.candidatePreparationMs);
+        pointCloudPreparationBatchMaxMs = std::max(
+            pointCloudPreparationBatchMaxMs, result.pointCloudPreparationMs);
+        for (const auto& stage : result.registration.stageTimingsMs) {
+            auto& maximum = registrationStageBatchMaxMs[stage.first];
+            maximum = std::max(maximum, stage.second);
+        }
+    }
 
     const FrameResult* best = nullptr;
     for (const auto& result : results) {
         if (!result.passed || !result.sourceCloud) continue;
-        if (!best ||
+        const bool betterManualScore = manualRoiMode && best &&
+            (result.registration.fitness > best->registration.fitness ||
+             (result.registration.fitness == best->registration.fitness &&
+              std::tie(result.registration.sourceToTargetRmseMm,
+                       result.registration.sourceToTargetP95Mm) <
+              std::tie(best->registration.sourceToTargetRmseMm,
+                       best->registration.sourceToTargetP95Mm)));
+        const bool betterAutomaticQuality = !manualRoiMode && best &&
             std::tie(result.registration.sourceToTargetRmseMm,
                      result.registration.sourceToTargetP95Mm) <
             std::tie(best->registration.sourceToTargetRmseMm,
-                     best->registration.sourceToTargetP95Mm))
+                     best->registration.sourceToTargetP95Mm);
+        if (!best || betterManualScore || betterAutomaticQuality)
             best = &result;
     }
 
@@ -1153,8 +1835,17 @@ int main(int argc, char** argv) {
     }
 
     std::cout << "registration path: " << best->registration.initializationMethod << '\n';
-    for (const auto& stage : best->registration.stageTimingsMs)
-        reportTiming(timingPath, "registration_" + stage.first, stage.second);
+    if (best->registration.initializationMethod == "fpfh_ransac_icp") {
+        if (!best->keypointInitializationAccepted) {
+            std::cout << "keypoints detection failed or produced no reliable 3D pose; "
+                         "fallback to FPFH/RANSAC/ICP\n";
+        } else {
+            std::cout << "keypoint initialization failed the registration quality gate; "
+                         "fallback to FPFH/RANSAC/ICP\n";
+        }
+    } else {
+        std::cout << "keypoint initialization accepted; FPFH not used\n";
+    }
 
     const CameraFrame& bestFrame = frames[static_cast<std::size_t>(best->frameIndex)];
     const Eigen::Matrix4d cameraToStl = best->registration.transformation;
@@ -1165,6 +1856,16 @@ int main(int argc, char** argv) {
     if (!open3d::io::WritePointCloud(
             (cameraDir / "camera_face_cloud.ply").string(), *best->sourceCloud))
         return EXIT_FAILURE;
+    if (!best->semanticMask.empty()) {
+        cv::imwrite((cameraDir / "camera_face_mask.png").string(),
+                    best->semanticMask);
+        cv::Mat overlay = bestFrame.color.clone();
+        cv::Mat tint(overlay.size(), overlay.type(), cv::Scalar(0, 255, 0));
+        cv::Mat blended;
+        cv::addWeighted(overlay, 0.65, tint, 0.35, 0.0, blended);
+        blended.copyTo(overlay, best->semanticMask);
+        cv::imwrite((cameraDir / "camera_face_mask_overlay.png").string(), overlay);
+    }
     auto aligned = std::make_shared<open3d::geometry::PointCloud>(*best->sourceCloud);
     aligned->Transform(cameraToStl);
     if (!open3d::io::WritePointCloud(
@@ -1185,6 +1886,8 @@ int main(int argc, char** argv) {
     if (manualRoiMode) {
         cv::imwrite((roiDir / "selected_roi.png").string(), annotated);
         saveRoiDebugArtifacts(bestFrame, best->bbox, roiDir, "manual_roi");
+    } else if (targetLocator == "sapiens_seg") {
+        cv::imwrite((faceSegmentationDir / "segmented_face.png").string(), annotated);
     } else {
         cv::imwrite((faceDetectionDir / "detected_face.png").string(), annotated);
     }
@@ -1237,15 +1940,42 @@ int main(int argc, char** argv) {
     if (readyError) return EXIT_FAILURE;
 
     std::ofstream sessionInfo(outputDir / "session_info.txt", std::ios::app);
-    sessionInfo << "processing=batch_parallel_in_memory\n"
+    sessionInfo << "processing="
+                << (manualRoiMode ? "batch_concurrent_in_memory"
+                                  : "global_top1_in_memory") << '\n'
                 << "selected_frame=" << best->frameIndex << '\n'
                 << "selected_source_rmse_mm="
                 << best->registration.sourceToTargetRmseMm << '\n'
                 << "selected_source_p95_mm="
                 << best->registration.sourceToTargetP95Mm << '\n';
-    reportTiming(
-        timingPath, "registration_total_excluding_initial_model_reconstruction",
-        std::max(0.0, elapsedMs(registrationTotalStart) -
-                      excludedInitialModelReconstructionMs));
+    const std::string localizationStage = manualRoiMode
+        ? ""
+        : targetLocator == "sapiens_seg" ? "face_segmentation" : "face_detection";
+    const std::string keypointStage = keypointProvider == "sapiens_pose"
+        ? "sapiens_pose_keypoint_detection" : "hrnet_keypoint_detection";
+    // Pose must be loaded after Seg releases GPU memory. Count that required
+    // runtime transition as part of the keypoint stage, rather than exposing
+    // internal diagnostic/test timings.
+    totalKeypointDetectionMs += modelTransitionMs;
+    std::vector<std::pair<std::string, double>> detailedTimings;
+    double fpfhRansacMs = 0.0;
+    if (best->registration.initializationMethod == "fpfh_ransac_icp") {
+        for (const auto& stage : best->registration.stageTimingsMs) {
+            if (stage.first == "fpfh_feature_extraction" ||
+                stage.first.rfind("ransac_attempt_", 0) == 0)
+                fpfhRansacMs += stage.second;
+        }
+        detailedTimings.emplace_back("fpfh_ransac_coarse_registration",
+                                     fpfhRansacMs);
+    }
+    const double pointCloudProcessingMs = std::max(0.0,
+        endToEndTotalMs - targetLocalizationMs - totalKeypointDetectionMs -
+        totalSvdVotingMs - totalIcpIterationsMs - fpfhRansacMs);
+    detailedTimings.emplace_back("point_cloud_processing",
+                                 pointCloudProcessingMs);
+    writeFinalTimings(timingPath, localizationStage, targetLocalizationMs,
+                      keypointStage, totalKeypointDetectionMs,
+                      totalSvdVotingMs, totalIcpIterationsMs,
+                      endToEndTotalMs, detailedTimings);
     return EXIT_SUCCESS;
 }

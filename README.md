@@ -1,8 +1,8 @@
 # Face Registration C++
 
-## 当前算法流程（适用于所有分支）
+## 1. 当前算法流程（适用于所有分支）
 
-运行时由 `C++/config/runtime.yml` 选择定位器、关键点模型和粗配准求解器，不再按旧的 1.1～1.3 分开理解：
+运行时由 `C++/config/runtime.yml` 选择定位器、关键点模型和粗配准求解器：
 
 ```text
 STL/模型点云预处理完成（不计入正式定位计时）
@@ -30,51 +30,6 @@ STL/模型点云预处理完成（不计入正式定位计时）
 旧版 1.1～1.3 说明仅作历史记录，以上统一流程和 `runtime.yml` 是当前实现的准则。
 
 纯 C++17 人脸/头模点云配准工程。推理统一使用 ONNX Runtime；图像处理使用 OpenCV；点云粗配准和精配准使用 Open3D；相机支持 Orbbec，Windows 额外支持 Vcamera。
-
-## 1. 算法流程
-
-### 1.1 Face Detection + Face Keypoints 配准
-
-```text
-采集 N 帧 RGB、深度和有序点云
-→ N 帧并行执行 YOLO Face Detection
-→ 深度、尺寸、点数和点密度门控
-→ 汇总有效候选并按 Detection score 排序
-→ 选择全局 Top-1
-→ 只对 Top-1 执行 HRNet-WFLW 关键点检测
-→ RGB 关键点结合深度生成同名三维点
-→ triplet_vote 或 overdetermined_svd 求初始刚体变换
-→ 多尺度 ICP
-→ 关键点位姿未通过门控时回退到 FPFH + RANSAC + ICP
-```
-
-### 1.2 手动 ROI 配准
-
-```text
-采集一帧对齐的 RGB、深度和有序点云
-→ 弹出 RGB 窗口并交互选择 ROI
-→ 写入 output/时间戳/roi/manual_roi.txt
-→ 裁剪 ROI 三维点云
-→ 按 runtime.yml 选择 HRNet 或 Sapiens Pose
-→ 相机/STL 同名或同索引关键点求粗变换
-→ 多尺度 ICP
-→ 关键点不足时回退 FPFH + RANSAC + ICP
-```
-
-该模式只用手动框替代目标定位，关键点、粗配准和 ICP 仍属于同一条流水线。
-
-### 1.3 Sapiens2 Seg + Pose
-
-```text
-Orbbec 采集并对齐 RGB 与深度
-→ Sapiens2 Seg 生成人脸语义 mask
-→ 深度范围定位目标头部
-→ Sapiens2 Pose 输出 308 个关键点
-→ 选择 Sapiens2 脸部关键点
-→ 使用 Pose score 和 Seg mask 邻域覆盖率筛除遮挡点
-```
-
-该流程不使用 HRNet 98 点。
 
 ## 2. 模型目录
 

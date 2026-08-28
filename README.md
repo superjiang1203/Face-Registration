@@ -1,5 +1,34 @@
 # Face Registration C++
 
+## 当前算法流程（适用于所有分支）
+
+运行时由 `C++/config/runtime.yml` 选择定位器、关键点模型和粗配准求解器，不再按旧的 1.1～1.3 分开理解：
+
+```text
+STL/模型点云预处理完成（不计入正式定位计时）
+→ 采集 RGB、深度和有序点云（自动分支采集配置的 N 帧）
+→ 目标定位：YOLO Face / Sapiens2 Seg / --manual-roi
+→ 多帧按 detection score 或 mask 质量选 Top-1
+→ 仅对目标运行 HRNet 或 Sapiens2 Pose
+→ 关键点结合深度生成 3D 点，过滤低置信度、无效深度和遮挡点
+→ triplet_vote 或 overdetermined_svd 求粗变换
+→ 粗匹配失败时 FPFH + RANSAC，再执行 ICP 精配准
+→ 结果写入 output/时间戳/，并输出各阶段及总耗时
+```
+
+可用组合如下：
+
+| `target_locator` | `keypoint_model` | 流程 |
+|---|---|---|
+| `face_detection` | `hrnet` | YOLO Top-1 → HRNet 98 点 → SVD/ICP |
+| `face_detection` | `sapiens_pose` | YOLO Top-1 → Sapiens2 Pose 脸部点 → SVD/ICP |
+| `sapiens_seg` | `hrnet` | Seg mask → mask 内 HRNet 点 → SVD/ICP |
+| `sapiens_seg` | `sapiens_pose` | Seg mask → mask 内、未遮挡的 Sapiens2 脸部点 → SVD/ICP |
+
+使用 `--manual-roi` 时，ROI 窗口结束后自动保存 `output/时间戳/roi/manual_roi.txt`，并直接进入相同的关键点、粗配准和 ICP 流程，不再运行 YOLO/Seg 定位。
+
+旧版 1.1～1.3 说明仅作历史记录，以上统一流程和 `runtime.yml` 是当前实现的准则。
+
 纯 C++17 人脸/头模点云配准工程。推理统一使用 ONNX Runtime；图像处理使用 OpenCV；点云粗配准和精配准使用 Open3D；相机支持 Orbbec，Windows 额外支持 Vcamera。
 
 ## 1. 算法流程

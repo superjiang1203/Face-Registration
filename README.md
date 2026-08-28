@@ -47,37 +47,37 @@ models/
 
 以下命令均在仓库根目录执行，每个代码块是一条可直接复制的完整命令。
 
-作用：确认当前目录是工程根目录。
+确认当前目录是工程根目录。
 
 ```powershell
 Test-Path .\CMakeLists.txt
 ```
 
-作用：安装 CMake。
+安装 CMake。
 
 ```powershell
 winget install --id Kitware.CMake --exact --accept-source-agreements --accept-package-agreements
 ```
 
-作用：安装 Visual Studio 2022 C++ Build Tools。
+安装 Visual Studio 2022 C++ Build Tools。
 
 ```powershell
 winget install --id Microsoft.VisualStudio.2022.BuildTools --exact --override "--wait --passive --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended" --accept-source-agreements --accept-package-agreements
 ```
 
-作用：解压第三方 C++ 依赖、配置 CMake 并编译 Release。
+解压第三方 C++ 依赖、配置 CMake 并编译 Release。
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\C++\scripts\windows\build_windows.ps1
 ```
 
-作用：使用纯 CMake 命令重新配置 Visual Studio 2022 x64 工程。
+使用纯 CMake 命令重新配置 Visual Studio 2022 x64 工程。
 
 ```powershell
 cmake -S . -B build -G "Visual Studio 17 2022" -A x64
 ```
 
-作用：使用纯 CMake 命令编译 Release。
+使用纯 CMake 命令编译 Release。
 
 ```powershell
 cmake --build build --config Release --parallel
@@ -93,7 +93,7 @@ sapiens_seg.exe
 sapiens_pose.exe
 ```
 
-## 4. 调用算法 1.1
+## 4. 调用算法
 
 配置文件为 `C++/config/runtime.yml`：
 
@@ -133,25 +133,25 @@ camera_keypoints:
 | Sapiens Seg | HRNet-WFLW | `--target-locator sapiens_seg --keypoint-provider hrnet` |
 | Sapiens Seg | Sapiens Pose | `--target-locator sapiens_seg --keypoint-provider sapiens_pose` |
 
-作用：使用 Face Detection 定位目标，使用 HRNet 关键点初始化 SVD/ICP。
+使用 Face Detection 定位目标，使用 HRNet 关键点初始化 SVD/ICP。
 
 ```powershell
 .\build\C++\Release\face_camera_pipeline.exe --config ".\C++\config\runtime.yml" --target-locator face_detection --keypoint-provider hrnet --threads 4 --camera-backend orbbec --camera-sn CP2AB53000CK ".\models\face_detection\yolo_face\yolov12n-face.onnx" ".\models\face_keypoints\hrnet\hrnetv2_w18_wflw_256x256_heatmap.onnx" ".\output"
 ```
 
-作用：使用 Face Detection 定位目标，使用 Sapiens Pose 稠密脸部点执行超定 SVD/ICP。
+使用 Face Detection 定位目标，使用 Sapiens Pose 稠密脸部点执行超定 SVD/ICP。
 
 ```powershell
 .\build\C++\Release\face_camera_pipeline.exe --config ".\C++\config\runtime.yml" --target-locator face_detection --keypoint-provider sapiens_pose --threads 4 --camera-backend orbbec --camera-sn CP2AB53000CK ".\models\face_detection\yolo_face\yolov12n-face.onnx" - ".\output"
 ```
 
-作用：使用 Sapiens Seg 定位目标 mask，使用 HRNet 关键点初始化 SVD/ICP。
+使用 Sapiens Seg 定位目标 mask，使用 HRNet 关键点初始化 SVD/ICP。
 
 ```powershell
 .\build\C++\Release\face_camera_pipeline.exe --config ".\C++\config\runtime.yml" --target-locator sapiens_seg --keypoint-provider hrnet --threads 4 --camera-backend orbbec --camera-sn CP2AB53000CK - ".\models\face_keypoints\hrnet\hrnetv2_w18_wflw_256x256_heatmap.onnx" ".\output"
 ```
 
-作用：使用 Sapiens Seg 定位目标 mask，使用 Sapiens Pose 稠密脸部点执行超定 SVD/ICP。
+使用 Sapiens Seg 定位目标 mask，使用 Sapiens Pose 稠密脸部点执行超定 SVD/ICP。
 
 ```powershell
 .\build\C++\Release\face_camera_pipeline.exe --config ".\C++\config\runtime.yml" --target-locator sapiens_seg --keypoint-provider sapiens_pose --threads 4 --camera-backend orbbec --camera-sn CP2AB53000CK - - ".\output"
@@ -159,41 +159,11 @@ camera_keypoints:
 
 `pose_solver` 可设为 `triplet_vote` 或 `overdetermined_svd`，修改配置后不需要重新编译。
 
-作用：枚举 Orbbec 相机，不执行推理。
+枚举 Orbbec 相机，不执行推理。
 
 ```powershell
 .\build\C++\Release\face_camera_pipeline.exe --camera-backend orbbec --list-cameras
 ```
-
-作用：采集 4 帧并行执行 Face Detection，选择全局 Top-1，然后执行 HRNet、SVD 和配准。
-
-```powershell
-.\build\C++\Release\face_camera_pipeline.exe --config ".\C++\config\runtime.yml" --threads 4 --camera-backend orbbec --camera-sn CP2AB53000CK ".\models\face_detection\yolo_face\yolov12n-face.onnx" ".\models\face_keypoints\hrnet\hrnetv2_w18_wflw_256x256_heatmap.onnx" ".\output"
-```
-
-作用：使用 Vcamera 执行相同流程。
-
-```powershell
-.\build\C++\Release\face_camera_pipeline.exe --config ".\C++\config\runtime.yml" --threads 4 --camera-backend vcamera --camera-sn 207000167813 --laser-auto off --laser-power 25 ".\models\face_detection\yolo_face\yolov12n-face.onnx" ".\models\face_keypoints\hrnet\hrnetv2_w18_wflw_256x256_heatmap.onnx" ".\output"
-```
-
-相机 SN 应替换为枚举得到的实际序列号。
-
-## 5. 调用算法 1.2
-
-作用：单独验证 ROI 窗口和 txt 输出，不执行配准。
-
-```powershell
-.\build\C++\Release\manual_roi.exe --camera-sn CP2AB53000CK --output ".\output\manual_roi.txt"
-```
-
-作用：在完整配准程序中弹窗选择 ROI，自动写入当前时间戳目录，然后按照 `runtime.yml` 的 `keypoint_model` 执行关键点、粗配准和 ICP。
-
-```powershell
-.\build\C++\Release\face_camera_pipeline.exe --config ".\C++\config\runtime.yml" --manual-roi --camera-backend orbbec --camera-sn CP2AB53000CK - - ".\output"
-```
-
-窗口中拖动鼠标选择人脸，按 Enter 或空格确认，按 ESC 取消（C 可清除当前框）。确认后才开始总计时；默认先按 `camera.yml` 的分辨率和 FPS 采集 8 帧，再并发处理。每帧默认只执行 1 次 FPFH/RANSAC + ICP，最后优先按 fitness、再按 RMSE/P95 选择最佳结果。帧数和单帧全局尝试数分别由 `pipeline.manual_roi_frames`、`pipeline.manual_roi_global_attempts` 控制。
 
 ### Windows/Linux 算法脚本
 
@@ -219,60 +189,7 @@ CAMERA_SN=CP2AB53000CK bash C++/scripts/linux/run_face_keypoints.sh
 CAMERA_SN=CP2AB53000CK bash C++/scripts/linux/run_face_segmentation.sh
 ```
 
-## 6. 调用算法 1.3
-
-算法 1.3 由两个纯 C++ 可执行程序顺序执行。
-
-作用：从 Orbbec 拍摄 RGB/深度，运行 Sapiens2 Seg，在 500–600 mm 中定位目标并输出 RGB 和 `target_face_mask.png`。
-
-```powershell
-.\build\C++\Release\sapiens_seg.exe --model ".\models\face_segmentation\sapiens2_seg\sapiens2_seg_0.4b_fp32.onnx" --camera-sn CP2AB53000CK --min-depth-mm 500 --max-depth-mm 600 --warmup 15 --no-hrnet --output ".\output\sapiens2_pose_live\capture"
-```
-
-作用：读取上一条命令产生的 RGB 和 mask，运行 Sapiens2 Pose，并输出全部脸部关键点和未遮挡脸部关键点。
-
-```powershell
-.\build\C++\Release\sapiens_pose.exe ".\models\face_keypoints\sapiens2_pose\sapiens2_pose_0.4b_fp32.onnx" ".\output\sapiens2_pose_live\capture\color.png" ".\output\sapiens2_pose_live\capture\target_face_mask.png" ".\output\sapiens2_pose_live\pose" 0.25 0.20 5
-```
-
-三个末尾参数依次表示 Pose score 阈值、mask 邻域覆盖率阈值和邻域半径像素数。
-
-## 7. 输出
-
-算法 1.1 和 1.2 每次建立独立会话目录：
-
-```text
-output/YYYY-MM-DD_HH-MM-SS-ms/
-├── face_detection/
-├── face_keypoints_detection/
-├── camera/
-├── STL/
-├── logs/
-└── aligned_camera_face.ready
-```
-
-- `camera/aligned_camera_face.ply`：配准后的相机点云。
-- `STL/camera_to_stl_transformation.txt`：相机坐标到 STL 坐标的 4×4 变换。
-- `STL/pose_stl_to_camera.txt`：STL 坐标到相机坐标的 4×4 变换。
-- `logs/registration_timing.txt`：输出完整墙钟阶段以及配准内部明细。自动分支可用“目标定位 + registration_batch_wall + pipeline_control_overhead”核对总时间；手动分支可用“capture_batch + registration_batch_wall + pipeline_control_overhead”核对总时间。`detail_batch_max_*` 是并发帧的单阶段最大值，属于 registration_batch_wall 内部，不能再次与总时间相加。
-
-总耗时是墙钟时间，因此还包含相机采集、点云裁剪/滤波/降采样、法向估计、FPFH、RANSAC 和质量评估；这些过程按输出约定不单独打印，所以分项之和可以小于总耗时。手动 ROI 的交互等待不计入总耗时。
-- `registration_total_excluding_initial_model_reconstruction`：不包含首次 STL 表面点云重建的总时间。
-
-算法 1.3 主要输出：
-
-```text
-output/sapiens2_pose_live/
-├── capture/
-│   ├── color.png
-│   ├── target_face_mask.png
-│   └── overlay.png
-└── pose/
-    ├── sapiens2_pose_keypoints_onnx.json
-    └── sapiens2_visible_face_keypoints.json
-```
-
-## 8. C++ 库接口
+## 5. C++ 库接口
 
 构建后可链接以下静态库：
 
@@ -300,7 +217,7 @@ C++/hpp/registration/
 cmake --install build --config Release --prefix ".\install"
 ```
 
-## 9. Windows 到 Linux 迁移
+## 6. Windows 到 Linux 迁移
 
 作用：在 Windows 工程根目录创建迁移压缩包。
 
@@ -320,7 +237,7 @@ mkdir -p face_registration && tar -xzf face_registration-linux-transfer.tar.gz -
 cd face_registration && test -f CMakeLists.txt && echo "project root OK"
 ```
 
-## 10. Linux 编译
+## 7. Linux 编译
 
 作用：安装 Ubuntu 22.04 编译工具和运行库。
 
@@ -350,12 +267,4 @@ cmake -S . -B build/linux-Release -G Ninja -DCMAKE_BUILD_TYPE=Release
 
 ```bash
 cmake --build build/linux-Release --parallel
-```
-
-作用：枚举 Linux 下的 Orbbec 相机。
-
-```bash
-build/linux-Release/C++/face_camera_pipeline --camera-backend orbbec --list-cameras
-```
-
-Vcamera SDK 当前只有 Windows 库，Linux 支持 Orbbec 和离线配准。
+``` 

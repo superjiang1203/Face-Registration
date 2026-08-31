@@ -1014,9 +1014,8 @@ int main(int argc, char** argv) {
         if (annotation.success) {
             modelKeypointSourceSha256 = annotationSourceBefore.sha256Hex;
             modelKeypoints = std::move(annotation);
-            poseSolver = ModelKeypointAnnotationService::PoseSolver::OverdeterminedSvd;
             std::cout << "Sapiens model face keypoints=" << modelKeypoints->namedValidCount
-                      << "; pose solver forced to overdetermined_svd\n";
+                      << "; pose solver selected from runtime.yml\n";
         } else {
             std::cerr << "Sapiens STL keypoints failed; FPFH/RANSAC fallback remains active: "
                       << annotation.message << '\n';
@@ -1407,6 +1406,23 @@ int main(int argc, char** argv) {
                         segmentation = sapiensSegmenter->infer(
                             frames[static_cast<std::size_t>(frameIndex)].color);
                     }
+                    // Persist segmentation diagnostics before candidate gates
+                    // are evaluated.  This is intentionally done for every
+                    // frame, including frames that produce no accepted
+                    // candidate, so a gate failure remains debuggable.
+                    {
+                        const auto& segFrame = frames[static_cast<std::size_t>(frameIndex)];
+                        std::filesystem::create_directories(faceSegmentationDir);
+                        const std::string stem = "frame_" + std::to_string(frameIndex);
+                        if (!segmentation.coloredLabels.empty() &&
+                            segmentation.coloredLabels.size() == segFrame.color.size()) {
+                            cv::Mat overlay;
+                            cv::addWeighted(segFrame.color, 0.62,
+                                            segmentation.coloredLabels, 0.38, 0.0, overlay);
+                            cv::imwrite((faceSegmentationDir / (stem + "_overlay.png")).string(),
+                                        overlay);
+                        }
+                    }
                     cv::Mat groupingMask;
                     const cv::Mat groupingKernel = cv::getStructuringElement(
                         cv::MORPH_ELLIPSE, cv::Size(25, 25));
@@ -1677,6 +1693,21 @@ int main(int argc, char** argv) {
                         }
                         candidateKeypointMs = elapsedMs(keypointStart);
                         output.keypoints = extracted;
+                        const auto validRegistrationKeypoints = std::count_if(
+                            extracted.keypoints.begin(), extracted.keypoints.end(),
+                            [](const auto& keypoint) {
+                                return ModelKeypointAnnotationService::isRegistrationKeypoint(
+                                           keypoint.name) &&
+                                       keypoint.hasPoint;
+                            });
+                        if (extracted.keypoints.empty()) {
+                            std::cout << "SVD keypoint warning: frame=" << frameIndex
+                                      << " no keypoints detected\n";
+                        } else if (validRegistrationKeypoints == 0) {
+                            std::cout << "SVD keypoint warning: frame=" << frameIndex
+                                      << " keypoints detected, but none has a valid 3D point "
+                                         "inside the masked point cloud\n";
+                        }
                         if (extracted.success && modelKeypoints) {
                             const auto svdVotingStart = Clock::now();
                             const auto pose =
@@ -1684,6 +1715,10 @@ int main(int argc, char** argv) {
                                     extracted.keypoints, modelKeypoints->keypoints,
                                     keypointInlierThresholdMm,
                                     poseSolver);
+                            if (!pose.success) {
+                                std::cout << "SVD keypoint warning: frame=" << frameIndex
+                                          << " pose estimation failed: " << pose.message << '\n';
+                            }
                             candidateSvdVotingMs = elapsedMs(svdVotingStart);
                             if (FaceCandidateSelectionPolicy::isReliableKeypointPose(
                                     pose.success, pose.inlierCount, pose.rmseMm,

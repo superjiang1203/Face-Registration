@@ -11,7 +11,7 @@ pipeline:
   # Target-region provider used by the integrated pipeline.
   # --manual-roi temporarily replaces this stage only.
   # target_locator: face_detection | sapiens_seg
-  target_locator: face_detection
+  target_locator: sapiens_seg
   # Used after every target locator, including --manual-roi.
   # keypoint_model: hrnet | sapiens_pose
   keypoint_model: hrnet

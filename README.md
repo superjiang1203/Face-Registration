@@ -1,6 +1,6 @@
 # Face Registration C++
 
-## 1. 当前算法流程（适用于所有分支）
+## 1. 算法流程（适用于所有分支）
 
 运行时由 `C++/config/runtime.yml` 选择定位器、关键点模型和粗配准求解器：
 
@@ -27,7 +27,7 @@ STL/模型点云预处理完成（不计入正式定位计时）
 
 使用 `--manual-roi` 时，ROI 窗口结束后自动保存 `output/时间戳/roi/manual_roi.txt`，并直接进入相同的关键点、粗配准和 ICP 流程，不再运行 YOLO/Seg 定位。
 
-旧版 1.1～1.3 说明仅作历史记录，以上统一流程和 `runtime.yml` 是当前实现的准则。
+以上统一流程和 `runtime.yml` 是当前实现的准则。
 
 纯 C++17 人脸/头模点云配准工程。推理统一使用 ONNX Runtime；图像处理使用 OpenCV；点云粗配准和精配准使用 Open3D；相机支持 Orbbec，Windows 额外支持 Vcamera。
 
@@ -211,7 +211,7 @@ C++/hpp/pose/
 C++/hpp/registration/
 ```
 
-作用：安装 C++ 静态库、可执行程序、公共头文件和配置文件。
+安装 C++ 静态库、可执行程序、公共头文件和配置文件。
 
 ```powershell
 cmake --install build --config Release --prefix ".\install"
@@ -219,19 +219,19 @@ cmake --install build --config Release --prefix ".\install"
 
 ## 6. Windows 到 Linux 迁移
 
-作用：在 Windows 工程根目录创建迁移压缩包。
+在 Windows 工程根目录创建迁移压缩包。
 
 ```powershell
 tar.exe -czf ..\face_registration-linux-transfer.tar.gz --exclude=.git --exclude=build --exclude=thirdparty/build --exclude=data --exclude=output .
 ```
 
-作用：在 Linux 中解压工程。
+在 Linux 中解压工程。
 
 ```bash
 mkdir -p face_registration && tar -xzf face_registration-linux-transfer.tar.gz -C face_registration
 ```
 
-作用：进入工程并确认根目录。
+进入工程并确认根目录。
 
 ```bash
 cd face_registration && test -f CMakeLists.txt && echo "project root OK"
@@ -239,31 +239,31 @@ cd face_registration && test -f CMakeLists.txt && echo "project root OK"
 
 ## 7. Linux 编译
 
-作用：安装 Ubuntu 22.04 编译工具和运行库。
+安装 Ubuntu 22.04 编译工具和运行库。
 
 ```bash
 sudo apt-get update && sudo apt-get install -y build-essential cmake ninja-build pkg-config unzip libgl1 libglib2.0-0
 ```
 
-作用：为依赖解包脚本添加执行权限。
+为依赖解包脚本添加执行权限。
 
 ```bash
 chmod +x C++/scripts/linux/*.sh thirdparty/scripts/linux/*.sh
 ```
 
-作用：解压 Linux 第三方 C++ 依赖并编译 Release。
+解压 Linux 第三方 C++ 依赖并编译 Release。
 
 ```bash
 C++/scripts/linux/build_linux.sh
 ```
 
-作用：不使用构建脚本，直接用 CMake 和 Ninja 配置 Release。
+不使用构建脚本，直接用 CMake 和 Ninja 配置 Release。
 
 ```bash
 cmake -S . -B build/linux-Release -G Ninja -DCMAKE_BUILD_TYPE=Release
 ```
 
-作用：编译 Linux Release。
+编译 Linux Release。
 
 ```bash
 cmake --build build/linux-Release --parallel

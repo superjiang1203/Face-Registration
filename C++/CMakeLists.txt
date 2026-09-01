@@ -45,6 +45,30 @@ else()
 endif()
 set(ONNXRUNTIME_ROOT "${ONNXRUNTIME_ROOT}" CACHE PATH "ONNX Runtime root")
 
+# ONNX Runtime's CUDA provider does not bundle cuDNN. Keep the runtime in the
+# project third-party tree so builds never depend on Conda or a user profile.
+set(CUDNN_ROOT "${THIRDPARTY_DIR}/cudnn" CACHE PATH "Project-local cuDNN root")
+set(CUDNN_BIN_DIR "${CUDNN_ROOT}/bin")
+set(CUDA_RUNTIME_ROOT "${THIRDPARTY_DIR}/cuda_runtime" CACHE PATH
+  "Project-local CUDA runtime redistributables")
+set(CUDA_RUNTIME_BIN_DIR "${CUDA_RUNTIME_ROOT}/bin")
+if(WIN32 AND NOT EXISTS "${CUDNN_BIN_DIR}/cudnn64_9.dll")
+  message(FATAL_ERROR
+    "Project-local cuDNN is missing: ${CUDNN_BIN_DIR}/cudnn64_9.dll. "
+    "Run: powershell -File thirdparty/scripts/windows/packages.ps1 unpack")
+endif()
+foreach(_cuda_dll cublas64_12.dll cublasLt64_12.dll cufft64_11.dll cudart64_12.dll)
+  if(WIN32 AND NOT EXISTS "${CUDA_RUNTIME_BIN_DIR}/${_cuda_dll}")
+    message(FATAL_ERROR
+      "Project-local CUDA runtime is missing: ${CUDA_RUNTIME_BIN_DIR}/${_cuda_dll}. "
+      "Run: powershell -File thirdparty/scripts/windows/packages.ps1 unpack")
+  endif()
+endforeach()
+if(WIN32)
+  message(STATUS "Project-local cuDNN runtime: ${CUDNN_BIN_DIR}")
+  message(STATUS "Project-local CUDA runtime: ${CUDA_RUNTIME_BIN_DIR}")
+endif()
+
 find_package(OpenCV CONFIG REQUIRED COMPONENTS core imgproc imgcodecs calib3d dnn highgui)
 find_package(Open3D CONFIG REQUIRED)
 find_package(OrbbecSDK CONFIG REQUIRED)
@@ -117,8 +141,8 @@ vtk_module_autoinit(TARGETS face_registration MODULES ${FACE_VTK_MODULES})
 add_executable(face_registration_cli app/RegistrationCli.cpp)
 target_link_libraries(face_registration_cli PRIVATE face_registration)
 
-add_executable(face_camera_pipeline app/CameraPipeline.cpp)
-target_link_libraries(face_camera_pipeline PRIVATE face_registration face_segmentation face_pose)
+add_executable(face_registration_pipeline app/CameraPipeline.cpp)
+target_link_libraries(face_registration_pipeline PRIVATE face_registration face_segmentation face_pose)
 
 add_executable(manual_roi app/ManualRoi.cpp)
 target_link_libraries(manual_roi PRIVATE face_camera)
@@ -134,10 +158,13 @@ if(WIN32)
     "${THIRDPARTY_DIR}/opencv/x64/vc17/bin/*.dll"
     "${THIRDPARTY_DIR}/OrbbecSDK/bin/*.dll"
     "${THIRDPARTY_DIR}/open3d/bin/*.dll"
-    "${ONNXRUNTIME_ROOT}/lib/*.dll")
+    "${ONNXRUNTIME_ROOT}/lib/*.dll"
+    "${CUDA_RUNTIME_BIN_DIR}/*.dll"
+    "${CUDNN_BIN_DIR}/cudnn*.dll"
+    "${CUDNN_BIN_DIR}/zlibwapi.dll")
   foreach(FACE_EXECUTABLE
       face_registration_cli
-      face_camera_pipeline
+      face_registration_pipeline
       manual_roi
       sapiens_seg
       sapiens_pose)
@@ -156,21 +183,21 @@ if(WIN32)
       "${THIRDPARTY_DIR}/OrbbecSDK/bin/extensions"
       "$<TARGET_FILE_DIR:sapiens_seg>/extensions")
 
-  add_custom_command(TARGET face_camera_pipeline POST_BUILD
+  add_custom_command(TARGET face_registration_pipeline POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory
       "${THIRDPARTY_DIR}/OrbbecSDK/bin/extensions"
-      "$<TARGET_FILE_DIR:face_camera_pipeline>/extensions"
+      "$<TARGET_FILE_DIR:face_registration_pipeline>/extensions"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
       "${THIRDPARTY_DIR}/VcameraSDK/cpp/win/$<CONFIG>/bin/feature_config.xml"
       "${THIRDPARTY_DIR}/VcameraSDK/cpp/win/$<CONFIG>/bin/FeatureMap.xml"
-      "$<TARGET_FILE_DIR:face_camera_pipeline>"
+      "$<TARGET_FILE_DIR:face_registration_pipeline>"
     COMMAND ${CMAKE_COMMAND} -E copy_directory
       "${THIRDPARTY_DIR}/VcameraSDK/cpp/win/$<CONFIG>/bin"
-      "$<TARGET_FILE_DIR:face_camera_pipeline>"
+      "$<TARGET_FILE_DIR:face_registration_pipeline>"
     COMMAND_EXPAND_LISTS)
 endif()
 
 install(TARGETS face_camera face_detection face_segmentation face_pose face_registration
-  face_registration_cli face_camera_pipeline manual_roi sapiens_seg sapiens_pose)
+  face_registration_cli face_registration_pipeline manual_roi sapiens_seg sapiens_pose)
 install(DIRECTORY hpp/ DESTINATION include)
 install(DIRECTORY config/ DESTINATION share/face_registration/config)

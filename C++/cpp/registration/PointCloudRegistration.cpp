@@ -328,6 +328,9 @@ RegistrationResult PointCloudRegistration::alignClouds(
             stageStart = TimingClock::now();
             const std::filesystem::path path(outputPly);
             if (!path.parent_path().empty()) std::filesystem::create_directories(path.parent_path());
+            // The aligned result is the depth-camera source cloud. Use the
+            // same semantic color as the live camera pipeline output.
+            aligned.PaintUniformColor(Eigen::Vector3d(1.0, 0.25, 0.05));
             if (!open3d::io::WritePointCloud(outputPly, aligned))
                 throw std::runtime_error("cannot write aligned point cloud: " + outputPly);
             std::ofstream matrix(path.parent_path() / (path.stem().string() + "_transformation.txt"));

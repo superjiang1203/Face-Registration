@@ -266,6 +266,9 @@ HeadSurfaceReconstructor::Result HeadSurfaceReconstructor::reconstructRegistrati
         if (!outputPath.parent_path().empty()) std::filesystem::create_directories(outputPath.parent_path());
         open3d::geometry::PointCloud cloud;
         cloud.points_ = std::move(points);
+        // Keep reconstructed STL surfaces visually distinct from depth-camera
+        // clouds when both PLY files are opened together in MeshLab.
+        cloud.PaintUniformColor(Eigen::Vector3d(0.0, 0.65, 1.0));
         if (!open3d::io::WritePointCloud(outputPly, cloud))
             throw std::runtime_error("cannot write reconstructed PLY: " + outputPly);
         result.outputPointCount = cloud.points_.size();

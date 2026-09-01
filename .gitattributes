@@ -1,0 +1,4 @@
+/data/head.stl filter=lfs diff=lfs merge=lfs -text
+/models/face_keypoints/sapiens2_pose/*.onnx filter=lfs diff=lfs merge=lfs -text
+/models/face_segmentation/sapiens2_seg/*.onnx filter=lfs diff=lfs merge=lfs -text
+/models/face_segmentation/sapiens2_seg/*.onnx.data filter=lfs diff=lfs merge=lfs -text

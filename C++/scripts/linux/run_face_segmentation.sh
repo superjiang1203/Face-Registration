@@ -7,4 +7,4 @@ threads="${THREADS:-4}"
 args=(--config "$config_file" --target-locator sapiens_seg --threads "$threads" --camera-backend orbbec)
 [[ -n "${CAMERA_SN:-}" ]] && args+=(--camera-sn "$CAMERA_SN")
 cd "$project_root"
-exec ./build/linux-Release/C++/face_camera_pipeline "${args[@]}"
+exec ./build/linux-Release/C++/face_registration_pipeline "${args[@]}"

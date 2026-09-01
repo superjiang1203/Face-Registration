@@ -45,6 +45,12 @@
 namespace {
 using Clock = std::chrono::steady_clock;
 
+// Uniform semantic colors make overlaid registration clouds immediately
+// distinguishable in MeshLab and other PLY viewers. Open3D stores RGB values
+// as normalized doubles in [0, 1].
+const Eigen::Vector3d kCameraCloudColor{1.0, 0.25, 0.05};
+const Eigen::Vector3d kStlSurfaceColor{0.0, 0.65, 1.0};
+
 std::string trim(std::string value) {
     const auto first = value.find_first_not_of(" \t\r\n");
     if (first == std::string::npos) return {};
@@ -1888,8 +1894,11 @@ int main(int argc, char** argv) {
     if (!cameraToStl.array().isFinite().all() ||
         !stlToCamera.array().isFinite().all()) return EXIT_FAILURE;
 
+    auto cameraFaceCloud =
+        std::make_shared<open3d::geometry::PointCloud>(*best->sourceCloud);
+    cameraFaceCloud->PaintUniformColor(kCameraCloudColor);
     if (!open3d::io::WritePointCloud(
-            (cameraDir / "camera_face_cloud.ply").string(), *best->sourceCloud))
+            (cameraDir / "camera_face_cloud.ply").string(), *cameraFaceCloud))
         return EXIT_FAILURE;
     if (!best->semanticMask.empty()) {
         cv::imwrite((cameraDir / "camera_face_mask.png").string(),
@@ -1901,17 +1910,32 @@ int main(int argc, char** argv) {
         blended.copyTo(overlay, best->semanticMask);
         cv::imwrite((cameraDir / "camera_face_mask_overlay.png").string(), overlay);
     }
-    auto aligned = std::make_shared<open3d::geometry::PointCloud>(*best->sourceCloud);
+    auto aligned =
+        std::make_shared<open3d::geometry::PointCloud>(*cameraFaceCloud);
     aligned->Transform(cameraToStl);
     if (!open3d::io::WritePointCloud(
             (cameraDir / "aligned_camera_face.ply").string(), *aligned))
         return EXIT_FAILURE;
+
+    // Produce a single colored overlay in the STL coordinate system for
+    // direct inspection in MeshLab: reconstructed STL surface first (blue),
+    // followed by the registered depth-camera face cloud (orange-red).
+    auto registrationOverlay =
+        std::make_shared<open3d::geometry::PointCloud>(*registrationTargetCloud);
+    registrationOverlay->PaintUniformColor(kStlSurfaceColor);
+    *registrationOverlay += *aligned;
+    if (!open3d::io::WritePointCloud(
+            (outputDir / "registration_overlay.ply").string(),
+            *registrationOverlay))
+        return EXIT_FAILURE;
+
     if (!writeMatrix(stlDir / "camera_to_stl_transformation.txt", cameraToStl) ||
         !writeMatrix(stlDir / "pose_stl_to_camera.txt", stlToCamera))
         return EXIT_FAILURE;
     auto stlInCamera =
         std::make_shared<open3d::geometry::PointCloud>(*registrationTargetCloud);
     stlInCamera->Transform(stlToCamera);
+    stlInCamera->PaintUniformColor(kStlSurfaceColor);
     if (!open3d::io::WritePointCloud(
             (stlDir / "stl_surface_in_camera.ply").string(), *stlInCamera))
         return EXIT_FAILURE;
@@ -1961,6 +1985,7 @@ int main(int argc, char** argv) {
               << "selected_frame=" << best->frameIndex << '\n'
               << "camera_cloud=camera/camera_face_cloud.ply\n"
               << "aligned_cloud=camera/aligned_camera_face.ply\n"
+              << "registration_overlay=registration_overlay.ply\n"
               << "camera_to_stl=STL/camera_to_stl_transformation.txt\n"
               << "stl_to_camera=STL/pose_stl_to_camera.txt\n"
               << "stl_surface_in_camera=STL/stl_surface_in_camera.ply\n"

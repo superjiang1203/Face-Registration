@@ -9,11 +9,7 @@
 !/thirdparty/scripts/
 !/thirdparty/scripts/**
 
-# Sapiens2 weights use external ONNX data and are several GB. Obtain them
-# separately and place them at the paths documented in README.md.
-/models/face_keypoints/sapiens2_pose/*.onnx
-/models/face_segmentation/sapiens2_seg/*.onnx
-/models/face_segmentation/sapiens2_seg/*.onnx.data
+# Sapiens2 weights are tracked with Git LFS; see .gitattributes.
 
 # Only data/head.stl is the runtime registration target.
 /data/stl/
